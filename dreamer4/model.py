@@ -2,6 +2,7 @@
 import math
 from dataclasses import dataclass
 from enum import IntEnum
+from functools import lru_cache
 from typing import Optional, Tuple, Dict
 
 import torch
@@ -51,42 +52,46 @@ class TokenLayout:
         return out
 
 
+@torch.jit.script
 def temporal_patchify(videos_btchw: torch.Tensor, patch: int) -> torch.Tensor:
     """
     videos: (B,T,C,H,W) float in [0,1]
     returns: (B,T,Np,Dp) where Dp = patch*patch*C and Np = (H/patch)*(W/patch)
     """
-    assert videos_btchw.dim() == 5
     B, T, C, H, W = videos_btchw.shape
-    assert H % patch == 0 and W % patch == 0
     x = videos_btchw.reshape(B * T, C, H, W)
     cols = F.unfold(x, kernel_size=patch, stride=patch)          # (BT, C*pp, Np)
-    cols = cols.transpose(1, 2).contiguous()                     # (BT, Np, Dp)
+    cols = cols.transpose(1, 2)                                  # (BT, Np, Dp)
     Np, Dp = cols.shape[1], cols.shape[2]
-    return cols.reshape(B, T, Np, Dp)
+    return cols.reshape(B, T, Np, Dp).contiguous()
 
 
+@torch.jit.script
 def temporal_unpatchify(patches_btnd: torch.Tensor, H: int, W: int, C: int, patch: int) -> torch.Tensor:
     """
     patches: (B,T,Np,Dp) -> (B,T,C,H,W)
     """
-    assert patches_btnd.dim() == 4
     B, T, Np, Dp = patches_btnd.shape
-    assert Dp == C * patch * patch
     x = patches_btnd.reshape(B * T, Np, Dp).transpose(1, 2).contiguous()  # (BT, Dp, Np)
     out = F.fold(x, output_size=(H, W), kernel_size=patch, stride=patch)  # (BT, C, H, W)
     return out.reshape(B, T, C, H, W)
 
 
-def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None) -> torch.Tensor:
-    # fp32 by construction
+@lru_cache(maxsize=64)
+def _sinusoid_table_cached(n: int, d: int, base: float, device_str: str) -> torch.Tensor:
+    """Cached sinusoidal position table computation."""
+    device = torch.device(device_str)
     pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)  # (n,1)
     i   = torch.arange(d, device=device, dtype=torch.float32).unsqueeze(0)  # (1,d)
     k   = torch.floor(i / 2.0)
-    # stable: exp(log(base) * exponent)
     div = torch.exp(-(2.0 * k) / max(1.0, float(d)) * math.log(base))
     ang = pos * div
     return torch.where((i % 2) == 0, torch.sin(ang), torch.cos(ang))  # (n,d) fp32
+
+
+def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None) -> torch.Tensor:
+    device_str = str(device) if device is not None else "cpu"
+    return _sinusoid_table_cached(n, d, base, device_str)
 
 
 def add_sinusoidal_positions(tokens_btSd: torch.Tensor) -> torch.Tensor:
@@ -140,8 +145,10 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(d))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        return x * (self.scale / torch.sqrt(var + self.eps))
+        # Use mul instead of pow(2) to avoid intermediate allocation
+        # rsqrt is faster than sqrt + division
+        norm = torch.rsqrt(x.mul(x).mean(dim=-1, keepdim=True) + self.eps)
+        return x * norm * self.scale
 
 
 class MLP(nn.Module):
@@ -162,7 +169,7 @@ class MLP(nn.Module):
 
 
 class MultiheadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0, qkv_bias: bool = False):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -179,15 +186,15 @@ class MultiheadSelfAttention(nn.Module):
         attn_mask: bool, True means "allowed to attend" (for torch SDPA), broadcastable to (N,1,L,L) or (N,H,L,L)
         """
         N, L, D = x_nld.shape
-        q, k, v = self.qkv(x_nld).chunk(3, dim=-1)
-
-        q = q.view(N, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(N, L, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(N, L, self.n_heads, self.head_dim).transpose(1, 2)
+        # Fused reshape: directly to (N, L, 3, H, head_dim) then unbind
+        qkv = self.qkv(x_nld).view(N, L, 3, self.n_heads, self.head_dim)
+        # Unbind and transpose in one step using permute for better memory access
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, N, H, L, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Views, no copy
 
         drop = self.dropout_p if self.training else 0.0
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=is_causal)
-        y = y.transpose(1, 2).contiguous().view(N, L, D)
+        y = y.transpose(1, 2).reshape(N, L, D)  # reshape instead of view after transpose
         return self.out(y)
 
 
@@ -252,7 +259,8 @@ class SpaceSelfAttentionModality(nn.Module):
     def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
         B, T, S, D = x_btSd.shape
         x = x_btSd.reshape(B * T, S, D)
-        mask = self.attn_mask.expand(B * T, 1, S, S)
+        # Use None for full attention (faster path in SDPA)
+        mask = None if self.mode in ("wm_agent",) else self.attn_mask
         y = self.attn(x, attn_mask=mask, is_causal=False)
         return y.reshape(B, T, S, D)
 
@@ -268,15 +276,15 @@ class TimeSelfAttention(nn.Module):
         B, T, S, D = x_btSd.shape
         if self.latents_only:
             L = self.n_latents
-            lat = x_btSd[:, :, :L, :]  # (B,T,L,D)
-            lat_nld = lat.permute(0, 2, 1, 3).contiguous().view(B * L, T, D)
-            out = self.attn(lat_nld, is_causal=True)
+            # Extract latents and reshape for temporal attention
+            lat = x_btSd[:, :, :L, :].permute(0, 2, 1, 3).reshape(B * L, T, D)
+            out = self.attn(lat, is_causal=True)
             out = out.view(B, L, T, D).permute(0, 2, 1, 3).contiguous()
             x = x_btSd.clone()
             x[:, :, :L, :] = out
             return x
         else:
-            x_nld = x_btSd.permute(0, 2, 1, 3).contiguous().view(B * S, T, D)
+            x_nld = x_btSd.permute(0, 2, 1, 3).reshape(B * S, T, D)
             out = self.attn(x_nld, is_causal=True)
             return out.view(B, S, T, D).permute(0, 2, 1, 3).contiguous()
 

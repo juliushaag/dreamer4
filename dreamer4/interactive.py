@@ -781,14 +781,14 @@ def main():
     p.add_argument("--task", type=str, default="finger-turn-hard")
 
     # data
-    p.add_argument("--data_dir", type=str, default="/<path>/data")   # path to raw data
-    p.add_argument("--frames_dir", type=str, default="/<path>/frames128")   # path to processed frames
+    p.add_argument("--data_dir", type=str, default="/mnt/datasets/dreamer4/mixed-large")   # path to raw data
+    p.add_argument("--frames_dir", type=str, default="/mnt/datasets/dreamer4/mixed-large-shards")   # path to processed frames
     p.add_argument("--tasks_json", type=str, default="../tasks.json")   # task metadata
     p.add_argument("--shard_size", type=int, default=2048)
 
     # checkpoints
-    p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/step_0085000.pt")
-    p.add_argument("--dynamics_ckpt", type=str, default="./logs/dynamics_ckpts/latest.pt")
+    p.add_argument("--tokenizer_ckpt", type=str, default="/mnt/datasets/dreamer4/checkpoints/tokenizer.pt")
+    p.add_argument("--dynamics_ckpt", type=str, default="/mnt/datasets/dreamer4/checkpoints/dynamics.pt")
 
     # rollout
     p.add_argument("--fps", type=float, default=10.0)
@@ -803,7 +803,7 @@ def main():
     # web server
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=7860)
-    p.add_argument("--html", type=str, default="interactive.html")
+    p.add_argument("--html", type=str, default="dreamer4/interactive.html")
 
     # misc
     p.add_argument("--seed", type=int, default=0)

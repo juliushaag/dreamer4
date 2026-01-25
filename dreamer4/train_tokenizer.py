@@ -28,7 +28,7 @@ except ImportError:
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
+torch.backends.cuda.enable_flash_sdp(True)
 
 def is_torchrun() -> bool:
     return "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -162,6 +162,7 @@ def train(args):
         tasks=TASK_SET,
         seq_len=args.seq_len,
         iid_sampling=True,
+        verbose=is_rank0()
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -176,6 +177,7 @@ def train(args):
         drop_last=True,
         persistent_workers=(args.num_workers > 0),
         worker_init_fn=worker_init_fn,
+        prefetch_factor=10
     )
 
     # ---- model ----
@@ -214,7 +216,6 @@ def train(args):
     model = Tokenizer(enc, dec).to(device)
 
     if is_rank0():
-        print(model)
         param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Learnable parameters: {param_count:,}")
 
@@ -227,7 +228,7 @@ def train(args):
         )
 
     # ---- optim ----
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=torch.cuda.is_available())
     use_amp = torch.cuda.is_available()
     scaler = GradScaler(device="cuda", enabled=use_amp)
 
@@ -273,15 +274,15 @@ def train(args):
                 if step >= args.max_steps:
                     break
 
+
                 x = x.to(device, non_blocking=True)  # (B,T,C,H,W)
-                patches = temporal_patchify(x, args.patch)
-
-                with torch.no_grad():
-                    z, _ = (model.module.encoder if hasattr(model, "module") else model.encoder)(patches)
+                with autocast(device_type="cuda", enabled=use_amp, dtype=torch.bfloat16):
+                    patches = temporal_patchify(x, args.patch)
                     if is_rank0() and step % args.log_every == 0:
-                        wandb.log({"debug/z_std": float(z.float().std().item())}, step=step)
+                        with torch.no_grad():
+                            z, _ = (model.module.encoder if hasattr(model, "module") else model.encoder)(patches)
+                            wandb.log({"debug/z_std": float(z.float().std().item())}, step=step)
 
-                with autocast(device_type="cuda", enabled=use_amp):
                     pred, mae_mask, keep_prob = model(patches)
 
                 # losses in fp32 (outside autocast)
@@ -377,9 +378,9 @@ if __name__ == "__main__":
 
     # data
     p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to preprocessed frames
-        "/<path>/expert-shards",
-        "/<path>/mixed-small-shards",
-        "/<path>/mixed-large-shards",
+        "/mnt/datasets/dreamer4/expert-shards",
+        "/mnt/datasets/dreamer4/mixed-small-shards",
+        "/mnt/datasets/dreamer4/mixed-large-shards",
     ])
     p.add_argument("--seq_len", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=8)
@@ -398,7 +399,7 @@ if __name__ == "__main__":
     p.add_argument("--n_latents", type=int, default=16)
     p.add_argument("--d_bottleneck", type=int, default=32)
     p.add_argument("--dropout", type=float, default=0.05)
-    p.add_argument("--mlp_ratio", type=float, default=4.0)
+    p.add_argument("--mlp_ratio", type=float, default=2.67)
     p.add_argument("--time_every", type=int, default=1)
     p.add_argument("--mae_p_min", type=float, default=0.0)
     p.add_argument("--mae_p_max", type=float, default=0.9)
@@ -422,8 +423,8 @@ if __name__ == "__main__":
     p.add_argument("--viz_max_T", type=int, default=8)
 
     # wandb
-    p.add_argument("--wandb_project", type=str, default="dreamer4-tokenizer")
-    p.add_argument("--wandb_run_name", type=str, default="default")
+    p.add_argument("--wandb_project", type=str, default="Dreamer")
+    p.add_argument("--wandb_run_name", type=str, default="run_01")
     p.add_argument("--wandb_entity", type=str, default=None)
 
     # ckpt

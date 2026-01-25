@@ -604,6 +604,7 @@ def train(args):
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
             collate_fn=collate_batch,
+            prefetch_factor=4 if args.num_workers > 0 else None,
         )
     else:
         dataset = ShardedFrameDataset(
@@ -622,6 +623,7 @@ def train(args):
             drop_last=True,
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
+            prefetch_factor=4 if args.num_workers > 0 else None,
         )
 
     # Load frozen tokenizer
@@ -680,7 +682,8 @@ def train(args):
 
     # Optimizer and scaler
     opt = torch.optim.AdamW(
-        dyn.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999)
+        dyn.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
+        fused=torch.cuda.is_available()
     )
     use_amp = torch.cuda.is_available()
     scaler = GradScaler(device="cuda", enabled=use_amp)
@@ -898,16 +901,18 @@ def train(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
+    dataset_path = "/mnt/datasets/dreamer4"
+
     # data (if using multiple datasets, make sure they align in order)
     p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
-        "/<path>/expert",
-        "/<path>/mixed-small",
-        "/<path>/mixed-large",
+        dataset_path + "/expert",
+        dataset_path + "/mixed-small",
+        dataset_path + "/mixed-large",
     ])
     p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
-        "/<path>/expert-shards",
-        "/<path>/mixed-small-shards",
-        "/<path>/mixed-large-shards",
+        dataset_path + "/expert-shards",
+        dataset_path + "/mixed-small-shards",
+        dataset_path + "/mixed-large-shards",
     ])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
     p.add_argument("--seq_len", type=int, default=32)

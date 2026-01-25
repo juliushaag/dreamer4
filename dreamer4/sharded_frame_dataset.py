@@ -3,10 +3,65 @@ import os
 import bisect
 from pathlib import Path
 from typing import Sequence, List, Dict, Union, Optional
-
+from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset
+import json
+from task_set import TASK_SET
 
+def create_meta_data(outdirs : list[str], output : Path, seq_len : int = 16):
+
+    if isinstance(outdirs, (str, Path)):
+        outdirs = [str(outdirs)]
+    else:
+        outdirs = [str(p) for p in outdirs]
+
+    output = Path(output)
+
+    tasks = list(TASK_SET)
+    seq_len = int(seq_len)
+
+    shards: List[Dict] = []
+    cum_starts: List[int] = []
+    total_starts = 0
+
+    task_dirs = [Path(root) / task for root in outdirs for task in tasks if (Path(root) / task).exists()]
+    task_dirs = tqdm(task_dirs, desc="Loading Dataset")
+
+    for task_dir in task_dirs:
+        for fname in sorted(os.listdir(task_dir)):
+            if not fname.endswith(".pt"):
+                continue
+            path = task_dir / fname
+
+            try:
+                td = torch.load(path, map_location="meta", mmap=True)
+            except Exception as e:
+                print(f"[ShardedFrameDataset] Skipping shard {path} (load error): {e}")
+                continue
+
+            frames = td.get("frames", None)
+            if not isinstance(frames, torch.Tensor):
+                print(f"[ShardedFrameDataset] Skipping shard {path} (no 'frames' tensor)")
+                continue
+            if frames.ndim != 4 or frames.shape[1] != 3:
+                print(f"[ShardedFrameDataset] Skipping shard {path} (unexpected shape {frames.shape})")
+                continue
+
+            N = int(frames.shape[0])
+
+            shards.append(
+                {"path": str(path), "num_frames": N}
+            )
+            cum_starts.append(total_starts)
+
+    
+    with open(output, "w") as fp:
+        json.dump(dict(
+            shards=shards,
+            cum_starts=cum_starts,
+            total_starts=total_starts
+        ),fp=fp)
 
 class ShardedFrameDataset(Dataset):
     """
@@ -26,6 +81,7 @@ class ShardedFrameDataset(Dataset):
         tasks: Sequence[str] = (),
         seq_len: int = 16,
         iid_sampling: bool = True,
+        verbose = False,
     ):
         super().__init__()
         assert outdirs is not None, "outdirs must be specified"
@@ -39,48 +95,18 @@ class ShardedFrameDataset(Dataset):
         self.seq_len = int(seq_len)
         self.iid_sampling = bool(iid_sampling)
 
-        self.shards: List[Dict] = []
+        with open( "/mnt/datasets/dreamer4/meta_data.json", "r") as fp:
+            data = json.load(fp=fp)
+
+        self.shards: List[Dict] = data["shards"]
         self.cum_starts: List[int] = []
         total_starts = 0
-
-        for root in self.outdirs:
-            root = Path(root)
-            for task in self.tasks:
-                task_dir = root / task
-                if not task_dir.exists():
-                    continue
-
-                for fname in sorted(os.listdir(task_dir)):
-                    if not fname.endswith(".pt"):
-                        continue
-                    path = task_dir / fname
-
-                    try:
-                        td = torch.load(path, map_location="cpu")
-                    except Exception as e:
-                        print(f"[ShardedFrameDataset] Skipping shard {path} (load error): {e}")
-                        continue
-
-                    frames = td.get("frames", None)
-                    if not isinstance(frames, torch.Tensor):
-                        print(f"[ShardedFrameDataset] Skipping shard {path} (no 'frames' tensor)")
-                        continue
-                    if frames.ndim != 4 or frames.shape[1] != 3:
-                        print(f"[ShardedFrameDataset] Skipping shard {path} (unexpected shape {frames.shape})")
-                        continue
-
-                    N = int(frames.shape[0])
-                    if N < self.seq_len:
-                        print(f"[ShardedFrameDataset] Skipping shard {path} (N={N} < seq_len={self.seq_len})")
-                        continue
-
-                    num_starts = N - self.seq_len + 1
-                    self.shards.append(
-                        {"path": str(path), "num_frames": N, "num_starts": num_starts}
-                    )
-                    total_starts += num_starts
-                    self.cum_starts.append(total_starts)
-
+        for shard in self.shards:
+            num_starts = shard["num_frames"] - self.seq_len + 1
+            shard["num_starts"] = num_starts
+            total_starts += num_starts
+            self.cum_starts.append(total_starts)
+            
         self.total_starts = total_starts
         if self.total_starts == 0:
             print("[ShardedFrameDataset] WARNING: no usable sequences found in outdirs")
@@ -100,7 +126,7 @@ class ShardedFrameDataset(Dataset):
     def _load_shard(self, path: str) -> torch.Tensor:
         if self._cache_path == path and self._cache_frames is not None:
             return self._cache_frames
-        td = torch.load(path, map_location="cpu")
+        td = torch.load(path, map_location="cpu", mmap=True)
         frames = td["frames"]
         self._cache_path = path
         self._cache_frames = frames
@@ -132,3 +158,13 @@ class ShardedFrameDataset(Dataset):
         end = start + self.seq_len
         seq_u8 = frames[start:end]  # (T, 3, H, W), guaranteed valid by construction
         return seq_u8.to(torch.float32) / 255.0
+
+if __name__ == "__main__":
+    
+    dirs = [
+        "/mnt/datasets/dreamer4/expert-shards",
+        "/mnt/datasets/dreamer4/mixed-small-shards",
+        "/mnt/datasets/dreamer4/mixed-large-shards",
+    ]
+    output = "/mnt/datasets/dreamer4/meta_data.json"
+    create_meta_data(dirs, output)

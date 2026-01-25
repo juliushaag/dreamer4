@@ -9,8 +9,8 @@ import torch.nn.functional as F
 from task_set import TASK_SET
 
 
-FILEDIR = "/<path>/expert"        # raw data source
-OUTDIR = "/<path>/expert-shards"  # preprocessed shards
+FILEDIR = "/mnt/datasets/dreamer4/mixed-small"        # raw data source
+OUTDIR = "/mnt/datasets/dreamer4/mixed-small-shards"  # preprocessed shards
 
 TARGET_SIZE = 128   # image resolution for training
 SHARD_SIZE = 2048   # number of frames per shard
