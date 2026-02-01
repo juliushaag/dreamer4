@@ -141,8 +141,6 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(d))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Use mul instead of pow(2) to avoid intermediate allocation
-        # rsqrt is faster than sqrt + division
         norm = torch.rsqrt(x.mul(x).mean(dim=-1, keepdim=True) + self.eps)
         return x * norm * self.scale
 
@@ -327,7 +325,8 @@ class BlockCausalLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.res1(x)
-        x = x + self.res2(x)
+        if self.do_time: 
+            x = x + self.res2(x)
         x = x + self.res3(x)
         return x
 

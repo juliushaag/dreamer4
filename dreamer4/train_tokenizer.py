@@ -123,27 +123,29 @@ def log_tokenizer_viz_wandb(
         step=step,
     )
 
+from miniconf import MiniConf
 
-def save_ckpt(path: Path, *, step: int, epoch: int, model, args: argparse.Namespace):
+def save_ckpt(path: Path, step: int, epoch: int, model, config : MiniConf):
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {
         "step": step,
         "epoch": epoch,
         "model": (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
         "opt": model.opt.state_dict(),
-        "args": vars(args),
+        "config": config.asdict(),
     }
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
     tmp.replace(path)
 
 
-def load_ckpt(path: Path, *, model) -> tuple[int, int]:
+def load_ckpt(path: Path, model) -> tuple[MiniConf, int, int]:
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["model"]
+    config = ckpt["config"]
     (model.module if hasattr(model, "module") else model).load_state_dict(state, strict=True)
     model.opt.load_state_dict(ckpt["opt"])
-    return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
+    return MiniConf(config), int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
 
 
 def train(args):
@@ -183,7 +185,8 @@ def train(args):
     d_patch = P * P * C              # patch dimension (pixels per patch)
 
 
-    ckpt_dir = conf.get("tokenizer/training/ckpt_dir", str)
+    ckpt_dir = Path(conf.get("tokenizer/training/ckpt_dir", str))
+    os.makedirs(ckpt_dir, exist_ok=True)
     
     enc = Encoder(n_patches=n_patches, d_patch=d_patch, **conf.select("tokenizer", data="/data"))
     dec = Decoder(n_patches=n_patches, d_patch=d_patch, **conf.select("tokenizer", data="/data"))
@@ -298,10 +301,10 @@ def train(args):
                 # ---- ckpt ----
                 if is_rank0() and save_every > 0 and (step % save_every == 0):
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
-                    save_ckpt(ckpt_path, step=step, epoch=epoch, model=model, args=args)
+                    save_ckpt(ckpt_path, step, epoch, model, conf)
                     # also update a "latest" pointer
                     latest = ckpt_dir / "latest.pt"
-                    save_ckpt(latest, step=step, epoch=epoch, model=model, args=args)
+                    save_ckpt(latest, step, epoch, model, conf)
 
             start_epoch = epoch + 1
 

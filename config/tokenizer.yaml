@@ -13,7 +13,7 @@ num_latents: 16
 bottleneck_dim: 32
 dropout: 0.05
 mlp_ratio: 2.67
-time_embedding_every: 1
+time_embedding_every: 4
 mae_prob_min: 0.0
 mae_prob_max: 0.9
 latents_only_time: true

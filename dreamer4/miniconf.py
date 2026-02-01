@@ -42,7 +42,7 @@ YAML features:
 """
 
 from __future__ import annotations
-from typing import Any, TypeVar, Type, Union, get_origin, get_args, get_type_hints
+from typing import Any, Optional, TypeVar, Type, Union, get_origin, get_args, get_type_hints
 from pathlib import Path
 import yaml
 import re
@@ -357,8 +357,8 @@ class MiniConf:
         
         return result
     
-    def asdict(self, conf_path : str) -> dict:
-        return self._resolve_path(conf_path)
+    def asdict(self, conf_path : Optional[str] = None) -> dict:
+        return self._resolve_path(conf_path or "")
 
 
     def _resolve_path(self, path: str) -> Any:
