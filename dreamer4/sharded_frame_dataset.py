@@ -63,6 +63,9 @@ def create_meta_data(outdirs : list[str], output : Path, seq_len : int = 16):
             total_starts=total_starts
         ),fp=fp)
 
+from miniconf import configclass, config_field
+
+@configclass
 class ShardedFrameDataset(Dataset):
     """
     Samples contiguous sequences from preprocessed shards across multiple roots:
@@ -74,27 +77,16 @@ class ShardedFrameDataset(Dataset):
     If iid_sampling=True, ignores idx and samples a random starting position
     uniformly over all valid sequence starts across all shards.
     """
+    outdirs : list[str] = config_field("processed")
+    tasks : list[str] = config_field("tasks")
+    seq_len : int = config_field("sequence_length")
+    iid_sampling : bool = config_field("iid_sampling")
 
-    def __init__(
-        self,
-        outdirs: Union[str, Sequence[str]],
-        tasks: Sequence[str] = (),
-        seq_len: int = 16,
-        iid_sampling: bool = True,
-        verbose = False,
-    ):
+
+    def __init__(self):
         super().__init__()
-        assert outdirs is not None, "outdirs must be specified"
 
-        if isinstance(outdirs, (str, Path)):
-            self.outdirs = [str(outdirs)]
-        else:
-            self.outdirs = [str(p) for p in outdirs]
-
-        self.tasks = list(tasks)
-        self.seq_len = int(seq_len)
-        self.iid_sampling = bool(iid_sampling)
-
+    
         with open( "/mnt/datasets/dreamer4/meta_data.json", "r") as fp:
             data = json.load(fp=fp)
 

@@ -2,13 +2,13 @@
 import math
 from dataclasses import dataclass
 from enum import IntEnum
-from functools import lru_cache
 from typing import Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from miniconf import configclass, MiniConf, config_field
+import lpips
 
 class Modality(IntEnum):
     LATENT = -1
@@ -50,8 +50,7 @@ class TokenLayout:
                 out[m] = slice(idx, idx + n)
             idx += n
         return out
-
-
+    
 @torch.jit.script
 def temporal_patchify(videos_btchw: torch.Tensor, patch: int) -> torch.Tensor:
     """
@@ -65,7 +64,6 @@ def temporal_patchify(videos_btchw: torch.Tensor, patch: int) -> torch.Tensor:
     Np, Dp = cols.shape[1], cols.shape[2]
     return cols.reshape(B, T, Np, Dp).contiguous()
 
-
 @torch.jit.script
 def temporal_unpatchify(patches_btnd: torch.Tensor, H: int, W: int, C: int, patch: int) -> torch.Tensor:
     """
@@ -76,8 +74,6 @@ def temporal_unpatchify(patches_btnd: torch.Tensor, H: int, W: int, C: int, patc
     out = F.fold(x, output_size=(H, W), kernel_size=patch, stride=patch)  # (BT, C, H, W)
     return out.reshape(B, T, C, H, W)
 
-
-@lru_cache(maxsize=64)
 def _sinusoid_table_cached(n: int, d: int, base: float, device_str: str) -> torch.Tensor:
     """Cached sinusoidal position table computation."""
     device = torch.device(device_str)
@@ -210,6 +206,9 @@ class SpaceSelfAttentionModality(nn.Module):
         attn_mask = allow.unsqueeze(0).unsqueeze(0)                # (1,1,S,S) True=allowed (PyTorch SDPA bool mask)
         self.register_buffer("attn_mask", attn_mask, persistent=False)
 
+        # Note: use self.attn_mask buffer in forward, not a separate attribute
+        self._use_mask = self.mode not in ("wm_agent",)
+
         self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
 
     def _build_allow(self, S: int) -> torch.Tensor:
@@ -259,8 +258,8 @@ class SpaceSelfAttentionModality(nn.Module):
     def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
         B, T, S, D = x_btSd.shape
         x = x_btSd.reshape(B * T, S, D)
-        # Use None for full attention (faster path in SDPA)
-        mask = None if self.mode in ("wm_agent",) else self.attn_mask
+        # Use registered buffer (moves with model to correct device)
+        mask = self.attn_mask if self._use_mask else None
         y = self.attn(x, attn_mask=mask, is_causal=False)
         return y.reshape(B, T, S, D)
 
@@ -272,22 +271,24 @@ class TimeSelfAttention(nn.Module):
         self.n_latents = int(n_latents)
         self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
 
-    def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
-        B, T, S, D = x_btSd.shape
-        if self.latents_only:
-            L = self.n_latents
-            # Extract latents and reshape for temporal attention
-            lat = x_btSd[:, :, :L, :].permute(0, 2, 1, 3).reshape(B * L, T, D)
-            out = self.attn(lat, is_causal=True)
-            out = out.view(B, L, T, D).permute(0, 2, 1, 3).contiguous()
-            x = x_btSd.clone()
-            x[:, :, :L, :] = out
-            return x
-        else:
-            x_nld = x_btSd.permute(0, 2, 1, 3).reshape(B * S, T, D)
-            out = self.attn(x_nld, is_causal=True)
-            return out.view(B, S, T, D).permute(0, 2, 1, 3).contiguous()
+        self.forward = self.forward_latents_only if self.latents_only else self.forward_latents_all
 
+    def forward_latents_all(self, x_btSd: torch.Tensor):
+        B, T, S, D = x_btSd.shape
+        x_nld = x_btSd.permute(0, 2, 1, 3).reshape(B * S, T, D)
+        out = self.attn(x_nld, is_causal=True)
+        return out.view(B, S, T, D).permute(0, 2, 1, 3).contiguous()
+
+    def forward_latents_only(self, x_btSd: torch.Tensor):
+        B, T, S, D = x_btSd.shape
+        L = self.n_latents
+        # Extract latents and reshape for temporal attention
+        lat = x_btSd[:, :, :L, :].permute(0, 2, 1, 3).reshape(B * L, T, D)
+        out = self.attn(lat, is_causal=True)
+        out = out.view(B, L, T, D).permute(0, 2, 1, 3).contiguous()
+        x = x_btSd.clone()
+        x[:, :, :L, :] = out
+        return x
 
 class BlockCausalLayer(nn.Module):
     def __init__(
@@ -306,28 +307,33 @@ class BlockCausalLayer(nn.Module):
         super().__init__()
         self.do_time = ((layer_index + 1) % time_every == 0)
 
-        self.norm1 = RMSNorm(d_model)
-        self.space = SpaceSelfAttentionModality(d_model, n_heads, modality_ids, n_latents, space_mode, dropout)
-        self.drop1 = nn.Dropout(dropout)
+        self.res1 = nn.Sequential(
+            RMSNorm(d_model),
+            SpaceSelfAttentionModality(d_model, n_heads, modality_ids, n_latents, space_mode, dropout),
+            nn.Dropout(dropout, True)
+        )
 
-        if self.do_time:
-            self.norm2 = RMSNorm(d_model)
-            self.time = TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents)
-            self.drop2 = nn.Dropout(dropout)
-
-        self.norm3 = RMSNorm(d_model)
-        self.mlp = MLP(d_model, mlp_ratio=mlp_ratio, dropout=dropout)
-        self.drop3 = nn.Dropout(dropout)
+        self.res2 = nn.Identity() if not self.do_time else nn.Sequential(
+            RMSNorm(d_model),
+            TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents),
+            nn.Dropout(dropout, True),
+        )
+        
+        self.res3 = nn.Sequential(
+            RMSNorm(d_model),
+            MLP(d_model, mlp_ratio=mlp_ratio, dropout=dropout),
+            nn.Dropout(dropout, True),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop1(self.space(self.norm1(x)))
-        if self.do_time:
-            x = x + self.drop2(self.time(self.norm2(x)))
-        x = x + self.drop3(self.mlp(self.norm3(x)))
+        x = x + self.res1(x)
+        x = x + self.res2(x)
+        x = x + self.res3(x)
         return x
 
 
 class BlockCausalTransformer(nn.Module):
+    """Sequential stack of BlockCausalLayer modules with optional gradient checkpointing."""
     def __init__(
         self,
         d_model: int,
@@ -340,69 +346,80 @@ class BlockCausalTransformer(nn.Module):
         mlp_ratio: float,
         time_every: int,
         latents_only_time: bool,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
-        self.layers = nn.ModuleList([
+        self.gradient_checkpointing = gradient_checkpointing
+        self.layers = nn.Sequential(*[
             BlockCausalLayer(
-                d_model=d_model, n_heads=n_heads, n_latents=n_latents,
-                modality_ids=modality_ids, space_mode=space_mode,
-                dropout=dropout, mlp_ratio=mlp_ratio,
-                layer_index=i, time_every=time_every,
+                d_model=d_model,
+                n_heads=n_heads,
+                n_latents=n_latents,
+                modality_ids=modality_ids,
+                space_mode=space_mode,
+                dropout=dropout,
+                mlp_ratio=mlp_ratio,
+                layer_index=i,
+                time_every=time_every,
                 latents_only_time=latents_only_time,
             )
             for i in range(depth)
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x)
-        return x
+        return self.layers(x)
 
-
+@configclass
 class Encoder(nn.Module):
-    def __init__(
-        self,
-        *,
-        patch_dim: int,
-        d_model: int,
-        n_latents: int,
-        n_patches: int,
-        n_heads: int,
-        depth: int,
-        d_bottleneck: int,
-        dropout: float = 0.0,
-        mlp_ratio: float = 4.0,
-        time_every: int = 4,
-        latents_only_time: bool = True,
-        mae_p_min: float = 0.0,
-        mae_p_max: float = 0.9,
-    ):
+    depth : int = config_field("num_layers")
+    n_heads : int = config_field("num_heads")
+    d_model : int = config_field("latent_dim")
+    d_bottleneck : int = config_field("bottleneck_dim")
+
+    n_latents : int = config_field("num_latents")
+
+    mlp_ratio : float = config_field("mlp_ratio")
+    dropout : float = config_field("dropout")
+    time_every : int = config_field("time_embedding_every")
+
+    latents_only_time : bool = config_field("latents_only_time")
+    gradient_checkpointing : bool = config_field("gradient_checkpointing")
+
+    mae_p_min : float = config_field("mae_p_min")
+    mae_p_max : float = config_field("mae_p_max")
+
+    def __init__(self, n_patches: int, d_patch: int):
         super().__init__()
-        self.d_model = d_model
-        self.n_latents = n_latents
-        self.n_patches = n_patches
 
-        self.patch_proj = nn.Linear(patch_dim, d_model)
-        self.bottleneck_proj = nn.Linear(d_model, d_bottleneck)
+        self.n_patches = n_patches  # number of spatial patches
+        self.d_patch = d_patch      # dimension of each patch (P*P*C)
 
-        self.layout = TokenLayout(n_latents=n_latents, segments=((Modality.IMAGE, n_patches),))
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+
+        self.patch_proj = nn.Linear(self.d_patch, self.d_model)
+        self.bottleneck_proj = nn.Linear(self.d_model, self.d_bottleneck)
+
+        self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
         modality_ids = self.layout.modality_ids()  # CPU buffer, moves with .to(device)
 
         self.transformer = BlockCausalTransformer(
-            d_model=d_model, n_heads=n_heads, depth=depth,
-            n_latents=n_latents, modality_ids=modality_ids,
-            space_mode="encoder",
-            dropout=dropout, mlp_ratio=mlp_ratio,
-            time_every=time_every, latents_only_time=latents_only_time,
+            d_model=self.d_model, n_heads=self.n_heads, depth=self.depth,
+            n_latents=self.n_latents, modality_ids=modality_ids, space_mode="encoder",
+            dropout=self.dropout, mlp_ratio=self.mlp_ratio,
+            time_every=self.time_every, latents_only_time=self.latents_only_time,
+            gradient_checkpointing=self.gradient_checkpointing,
         )
-        self.mae = MAEReplacer(d_model=d_model, p_min=mae_p_min, p_max=mae_p_max)
 
-        self.latents = nn.Parameter(torch.empty(n_latents, d_model))
+        self.mae = MAEReplacer(d_model=self.d_model, p_min=self.mae_p_min, p_max=self.mae_p_max)
+
+        self.latents = nn.Parameter(torch.empty(self.n_latents, self.d_model))
         nn.init.normal_(self.latents, std=0.02)
 
     def forward(self, patch_tokens_btnd: torch.Tensor):
+
         B, T, Np, Dp = patch_tokens_btnd.shape
         assert Np == self.n_patches
+        assert Dp == self.d_patch
 
         proj = self.patch_proj(patch_tokens_btnd)            # (B,T,Np,D)
         proj_masked, mae_mask, keep_prob = self.mae(proj)    # (B,T,Np,D), (B,T,Np,1), (B,T,1)
@@ -416,42 +433,50 @@ class Encoder(nn.Module):
         return z, (mae_mask, keep_prob)
 
 
+@configclass
 class Decoder(nn.Module):
-    def __init__(
-        self,
-        *,
-        d_bottleneck: int,
-        d_model: int,
-        n_heads: int,
-        depth: int,
-        n_latents: int,
-        n_patches: int,
-        d_patch: int,
-        dropout: float = 0.0,
-        mlp_ratio: float = 4.0,
-        time_every: int = 4,
-        latents_only_time: bool = True,
-    ):
-        super().__init__()
-        self.n_latents = n_latents
-        self.n_patches = n_patches
 
-        self.up_proj = nn.Linear(d_bottleneck, d_model)
-        self.patch_queries = nn.Parameter(torch.empty(n_patches, d_model))
+    depth : int = config_field("num_layers")
+    n_heads : int = config_field("num_heads")
+    d_model : int = config_field("latent_dim")
+    d_bottleneck : int = config_field("bottleneck_dim")
+
+    n_latents : int = config_field("num_latents")
+
+    mlp_ratio : float = config_field("mlp_ratio")
+    dropout : float = config_field("dropout")
+    time_every : int = config_field("time_embedding_every")
+
+    latents_only_time : bool = config_field("latents_only_time")
+    gradient_checkpointing : bool = config_field("gradient_checkpointing")
+
+    def __init__(self, n_patches: int, d_patch: int):
+        super().__init__()
+
+        self.n_patches = n_patches  # number of spatial patches
+        self._d_patch = d_patch     # dimension of each patch (P*P*C)
+
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+
+
+        self.up_proj = nn.Linear(self.d_bottleneck, self.d_model)
+        self.patch_queries = nn.Parameter(torch.empty(self.n_patches, self.d_model))
         nn.init.normal_(self.patch_queries, std=0.02)
 
-        self.patch_head = nn.Linear(d_model, d_patch)
+        self.patch_head = nn.Linear(self.d_model, self._d_patch)
 
-        self.layout = TokenLayout(n_latents=n_latents, segments=((Modality.IMAGE, n_patches),))
+        self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
         modality_ids = self.layout.modality_ids()
 
         self.transformer = BlockCausalTransformer(
-            d_model=d_model, n_heads=n_heads, depth=depth,
-            n_latents=n_latents, modality_ids=modality_ids,
-            space_mode="decoder",
-            dropout=dropout, mlp_ratio=mlp_ratio,
-            time_every=time_every, latents_only_time=latents_only_time,
+            d_model=self.d_model, n_heads=self.n_heads, depth=self.depth,
+            n_latents=self.n_latents, modality_ids=modality_ids, space_mode="decoder",
+            dropout=self.dropout, mlp_ratio=self.mlp_ratio,
+            time_every=self.time_every, latents_only_time=self.latents_only_time,
+            gradient_checkpointing=self.gradient_checkpointing,
         )
+
+
 
     def forward(self, z_btLd: torch.Tensor) -> torch.Tensor:
         B, T, L, _ = z_btLd.shape
@@ -466,18 +491,82 @@ class Decoder(nn.Module):
         x_p = x[:, :, L:, :]
         return torch.sigmoid(self.patch_head(x_p))                             # (B,T,Np,Dp)
 
-
+@configclass
 class Tokenizer(nn.Module):
-    def __init__(self, encoder: Encoder, decoder: Decoder):
+
+    H : int = config_field("data/image_height")
+    W : int = config_field("data/image_width")
+    C : int = config_field("data/image_channels")
+
+    num_patches : int = config_field("num_patches", ge=1)
+
+    lr : float = config_field("optim/lr")
+    weight_decay : float = config_field("optim/weight_decay")
+
+
+    lpips_fn : str = config_field("lpips/net")
+    lpips_frac : float = config_field("lpips/frac")
+    lpips_weight : float = config_field("lpips/weight")
+
+    compile : bool = config_field("compile")
+
+    def __init__(self, encoder: Encoder, decoder: Decoder, device : str):
         super().__init__()
+
+        self.device = device
         self.encoder = encoder
         self.decoder = decoder
+        
+        self.opt = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.lr, 
+            weight_decay=self.weight_decay, 
+            fused=torch.cuda.is_available()
+        )
+   
+        
+        self.lpips = lpips.LPIPS(net=self.lpips_fn).to(self.device)
+        self.lpips.eval()
+        self.lpips.requires_grad_(False)
+
+        if self.compile:
+            self.train_step = torch.compile(self.train_step)
 
     def forward(self, patches_btnd: torch.Tensor):
         z, (mae_mask, keep_prob) = self.encoder(patches_btnd)
         pred = self.decoder(z)
         return pred, mae_mask, keep_prob
 
+    def train_step(self, x: torch.Tensor, *, accumulate: bool = False):
+        """
+        Single training step with optional gradient accumulation.
+        
+        Args:
+            x: Input tensor (B,T,C,H,W)
+            accumulate: If True, skip optimizer step (for gradient accumulation)
+        """
+        patches = temporal_patchify(x, self.num_patches)
+ 
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred, mae_mask, keep_prob = self(patches)
+
+            # Keep loss computation in autocast for memory efficiency
+            mse = recon_loss_from_mae(pred, patches, mae_mask)
+
+            lp = lpips_on_mae_recon(
+                self.lpips, pred, patches, mae_mask,
+                H=self.H, W=self.W, C=self.C, patch=self.num_patches,
+                subsample_frac=self.lpips_frac
+            )
+            loss = mse + self.lpips_weight * lp
+
+        loss.backward()
+        
+        if not accumulate:
+            self.opt.step()
+            self.opt.zero_grad(set_to_none=True) 
+
+        return loss, mse, lp, keep_prob, mae_mask
 
 def pack_bottleneck_to_spatial(z_btLd: torch.Tensor, *, n_spatial: int, k: int) -> torch.Tensor:
     """
@@ -545,6 +634,7 @@ class TaskEmbedder(nn.Module):
     def __init__(
         self,
         d_model: int,
+        n_patches : int,
         n_agent: int = 1,
         use_ids: bool = True,
         n_tasks: int = 128,
@@ -561,6 +651,7 @@ class TaskEmbedder(nn.Module):
             self.task_table = nn.Embedding(self.n_tasks, self.d_model)
         else:
             self.task_proj = nn.Linear(self.d_task, self.d_model)
+
 
         self.agent_base = nn.Parameter(torch.empty(self.d_model))
         nn.init.normal_(self.agent_base, std=0.02)
@@ -693,17 +784,17 @@ class Dynamics(nn.Module):
         return x1_hat, h_t
 
 
-def recon_loss_from_mae(pred_btnd: torch.Tensor,
-                        target_btnd: torch.Tensor,
-                        mae_mask_btNp1: torch.Tensor) -> torch.Tensor:
-    # mask: (B,T,Np,1) bool, True where masked
-    mask = mae_mask_btNp1.to(dtype=torch.float32)  # (B,T,Np,1)
+def recon_loss_from_mae(pred : torch.Tensor, target : torch.Tensor, mask : torch.Tensor):
+    mask = mask.float()
 
-    # compute in fp32 to avoid fp16 overflow on reduction
-    diff = (pred_btnd.float() - target_btnd.float())          # (B,T,Np,Dp)
-    sq = diff.mul(diff) * mask                                # broadcast mask over Dp
-    denom = mask.sum().clamp_min(1.0) * diff.shape[-1]        # (#masked patches) * Dp
-    return sq.sum() / denom
+    diff = pred.float()
+    diff.sub_(target.float())
+    diff.square_()
+    diff.mul_(mask)
+
+    denom = mask.sum().clamp_min_(1.0) * diff.shape[-1]
+
+    return diff.sum() / denom
 
 
 def lpips_on_mae_recon(
@@ -715,6 +806,7 @@ def lpips_on_mae_recon(
     H: int, W: int, C: int, patch: int,
     subsample_frac: float = 1.0,
 ) -> torch.Tensor:
+    
     recon_masked_btnd = torch.where(mae_mask_btNp1, pred_btnd, target_btnd)
     recon = temporal_unpatchify(recon_masked_btnd.float(), H, W, C, patch)
     tgt   = temporal_unpatchify(target_btnd.float(),        H, W, C, patch)
@@ -731,7 +823,7 @@ def lpips_on_mae_recon(
     B, T = recon.shape[:2]
     recon = recon.reshape(B * T, C, H, W)
     tgt   = tgt.reshape(B * T, C, H, W)
+    
+    lp = lpips_fn(recon, tgt)
 
-    with torch.autocast(device_type="cuda", enabled=False):
-        lp = lpips_fn(recon, tgt)
     return lp.mean()

@@ -1,0 +1,49 @@
+image_height: 128
+image_width: 128
+image_channels: 3
+
+
+sequence_length: 16
+iid_sampling: true
+
+processed:
+  - /mnt/datasets/dreamer4/expert-shards
+  - /mnt/datasets/dreamer4/mixed-small-shards
+  - /mnt/datasets/dreamer4/mixed-large-shards 
+
+raw:
+  - /mnt/datasets/dreamer4/expert-shards
+  - /mnt/datasets/dreamer4/mixed-small-shards
+  - /mnt/datasets/dreamer4/mixed-large-shards 
+
+tasks:
+    - walker-stand
+    - walker-walk
+    - walker-run
+    - cheetah-run
+    - reacher-easy
+    - reacher-hard
+    - acrobot-swingup
+    - pendulum-swingup
+    - cartpole-balance
+    - cartpole-balance-sparse
+    - cartpole-swingup
+    - cartpole-swingup-sparse
+    - cup-catch
+    - finger-spin
+    - finger-turn-easy
+    - finger-turn-hard
+    - hopper-stand
+    - hopper-hop
+    - walker-walk-backward
+    - walker-run-backward
+    - cheetah-run-backward
+    - cheetah-run-front
+    - cheetah-run-back
+    - cheetah-jump
+    - hopper-hop-backward
+    - cup-spin
+    - pendulum-spin
+    - jumper-jump
+    - reacher-three-easy
+    - reacher-three-hard

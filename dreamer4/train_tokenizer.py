@@ -4,6 +4,7 @@ import time
 import random
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -18,13 +19,11 @@ from sharded_frame_dataset import ShardedFrameDataset
 from model import (
     Encoder, Decoder, Tokenizer,
     temporal_patchify, temporal_unpatchify,
-    recon_loss_from_mae, lpips_on_mae_recon,
 )
+from miniconf import MiniConf
 
-try:
-    import lpips
-except ImportError:
-    lpips = None
+import lpips
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -125,14 +124,13 @@ def log_tokenizer_viz_wandb(
     )
 
 
-def save_ckpt(path: Path, *, step: int, epoch: int, model, opt, scaler, args: argparse.Namespace):
+def save_ckpt(path: Path, *, step: int, epoch: int, model, args: argparse.Namespace):
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {
         "step": step,
         "epoch": epoch,
         "model": (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
-        "opt": opt.state_dict(),
-        "scaler": scaler.state_dict() if scaler is not None else None,
+        "opt": model.opt.state_dict(),
         "args": vars(args),
     }
     tmp = path.with_suffix(".tmp")
@@ -140,187 +138,115 @@ def save_ckpt(path: Path, *, step: int, epoch: int, model, opt, scaler, args: ar
     tmp.replace(path)
 
 
-def load_ckpt(path: Path, *, model, opt, scaler) -> tuple[int, int]:
+def load_ckpt(path: Path, *, model) -> tuple[int, int]:
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["model"]
     (model.module if hasattr(model, "module") else model).load_state_dict(state, strict=True)
-    opt.load_state_dict(ckpt["opt"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
+    model.opt.load_state_dict(ckpt["opt"])
     return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
 
 
 def train(args):
+
+    conf = MiniConf.load(args.config)
+
+    conf.pprint()
+
     ddp, rank, world_size, local_rank = init_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    seed_everything(args.seed + rank)
+    seed_everything(conf.get("seed", int) + rank)
 
     # ---- data ----
-    dataset = ShardedFrameDataset(
-        outdirs=args.data_dirs,
-        tasks=TASK_SET,
-        seq_len=args.seq_len,
-        iid_sampling=True,
-        verbose=is_rank0()
-    )
+    dataset = ShardedFrameDataset(**conf.select("data"))
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
 
     loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
         sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=(args.num_workers > 0),
         worker_init_fn=worker_init_fn,
-        prefetch_factor=10
+        shuffle=(sampler is None),
+        **conf.asdict("tokenizer/dataloader")
     )
 
     # ---- model ----
-    assert args.H % args.patch == 0 and args.W % args.patch == 0
-    n_patches = (args.H // args.patch) * (args.W // args.patch)
-    d_patch = args.patch * args.patch * args.C
+    H = conf.get("data/image_height", int)
+    W = conf.get("data/image_width", int)
+    C = conf.get("data/image_channels", int)
+    
 
-    assert args.d_model % args.n_heads == 0, "d_model must be divisible by n_heads"
+    P = conf.get("tokenizer/num_patches", int)  # This is actually patch_size (kernel/stride)
+    
+    assert H % P == 0 and W % P == 0
+    n_patches = (H // P) * (W // P)  # number of patches
+    d_patch = P * P * C              # patch dimension (pixels per patch)
 
-    enc = Encoder(
-        patch_dim=d_patch,
-        d_model=args.d_model,
-        n_latents=args.n_latents,
-        n_patches=n_patches,
-        n_heads=args.n_heads,
-        depth=args.depth,
-        d_bottleneck=args.d_bottleneck,
-        dropout=args.dropout,
-        mlp_ratio=args.mlp_ratio,
-        time_every=args.time_every,
-        mae_p_min=args.mae_p_min,
-        mae_p_max=args.mae_p_max,
-    )
-    dec = Decoder(
-        d_bottleneck=args.d_bottleneck,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        depth=args.depth,
-        n_latents=args.n_latents,
-        n_patches=n_patches,
-        d_patch=d_patch,
-        dropout=args.dropout,
-        mlp_ratio=args.mlp_ratio,
-        time_every=args.time_every,
-    )
-    model = Tokenizer(enc, dec).to(device)
+
+    ckpt_dir = conf.get("tokenizer/training/ckpt_dir", str)
+    
+    enc = Encoder(n_patches=n_patches, d_patch=d_patch, **conf.select("tokenizer", data="/data"))
+    dec = Decoder(n_patches=n_patches, d_patch=d_patch, **conf.select("tokenizer", data="/data"))
+    model = Tokenizer(enc, dec, device, **conf.select("tokenizer", data="/data")).to(device)
 
     if is_rank0():
         param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Learnable parameters: {param_count:,}")
-
-    if args.compile:
-        model = torch.compile(model)
 
     if ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False
         )
 
-    # ---- optim ----
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=torch.cuda.is_available())
-    use_amp = torch.cuda.is_available()
-    scaler = GradScaler(device="cuda", enabled=use_amp)
-
-    # ---- lpips ----
-    if args.lpips_weight > 0.0:
-        assert lpips is not None, "pip install lpips"
-        lpips_fn = lpips.LPIPS(net=args.lpips_net).to(device)
-        lpips_fn.eval()
-        lpips_fn.requires_grad_(False)
-    else:
-        lpips_fn = None
-
     # ---- wandb ----
     if is_rank0():
         wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            entity=args.wandb_entity,
-            mode="online",
-            config=vars(args),
+            **conf.asdict("/tokenizer/wandb"),
+            config=conf.data
         )
-
-    # ---- resume ----
-    step = 0
-    start_epoch = 0
-    ckpt_dir = Path(args.ckpt_dir)
-    if args.resume is not None:
-        step, start_epoch = load_ckpt(Path(args.resume), model=model, opt=opt, scaler=scaler)
-        if is_rank0():
-            print(f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch})")
 
     # ---- train ----
     model.train()
-    t0 = time.time()
-    grad_accum = max(1, int(args.grad_accum))
-
-    while step < args.max_steps:
+    t0 = time.monotonic()
+    step = 0
+    start_epoch = 0
+    max_steps = conf.get("tokenizer/training/maxsteps")
+    log_every = conf.get("tokenizer/training/log_every")
+    print_every = conf.get("tokenizer/training/print_every")
+    save_every = conf.get("tokenizer/training/save_every")
+    viz_every = conf.get("tokenizer/training/viz_every")
+    viz_max_items = conf.get("tokenizer/training/viz_max_items")
+    viz_max_T = conf.get("tokenizer/training/viz_max_T")
+    grad_accum = conf.get("tokenizer/optim/grad_accum")
+    
+    accum_step = 0  # Track accumulation steps
+    step_t0 = time.monotonic()  # Track time per step
+    
+    while step < max_steps:
         for epoch in range(start_epoch, 10_000_000):
             if sampler is not None:
                 sampler.set_epoch(epoch)
 
             for x in loader:
-                if step >= args.max_steps:
-                    break
-
-
                 x = x.to(device, non_blocking=True)  # (B,T,C,H,W)
-                with autocast(device_type="cuda", enabled=use_amp, dtype=torch.bfloat16):
-                    patches = temporal_patchify(x, args.patch)
-                    if is_rank0() and step % args.log_every == 0:
-                        with torch.no_grad():
-                            z, _ = (model.module.encoder if hasattr(model, "module") else model.encoder)(patches)
-                            wandb.log({"debug/z_std": float(z.float().std().item())}, step=step)
-
-                    pred, mae_mask, keep_prob = model(patches)
-
-                # losses in fp32 (outside autocast)
-                mse = recon_loss_from_mae(pred, patches, mae_mask)
-
-                if lpips_fn is not None and args.lpips_weight > 0.0:
-                    lp = lpips_on_mae_recon(
-                        lpips_fn, pred, patches, mae_mask,
-                        H=args.H, W=args.W, C=args.C, patch=args.patch,
-                        subsample_frac=args.lpips_frac
-                    )
-                    loss = mse + args.lpips_weight * lp
+                
+                # Gradient accumulation: only step optimizer every grad_accum batches
+                accumulate = (accum_step + 1) % grad_accum != 0
+                loss, mse, lp, keep_prob, mae_mask = model.train_step(x, accumulate=accumulate)
+                accum_step += 1
+                
+                # Only count as a "step" when we actually update weights
+                if not accumulate:
+                    step += 1
                 else:
-                    lp = torch.zeros((), device=device)
-                    loss = mse
+                    continue  # Skip logging/viz on accumulation steps
 
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"Non-finite loss at step {step}: loss={loss} mse={mse} lp={lp}")
-
-                loss_to_backprop = loss / grad_accum
-
-                scaler.scale(loss_to_backprop).backward()
-
-                do_step = ((step + 1) % grad_accum == 0)
-                if do_step:
-                    if use_amp:
-                        scaler.step(opt)
-
-                        if is_rank0() and step % args.log_every == 0:
-                            wandb.log({"amp/scale": float(scaler.get_scale())}, step=step)
-
-                        scaler.update()
-                    else:
-                        opt.step()
-                    opt.zero_grad(set_to_none=True)
+                # Measure step time
+                step_time = time.monotonic() - step_t0
+                step_t0 = time.monotonic()
 
                 # ---- logging ----
-                if is_rank0() and (step % args.log_every == 0):
+                if is_rank0() and (step % log_every == 0):
                     psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-10))
                     wandb.log(
                         {
@@ -330,41 +256,52 @@ def train(args):
                             "stats/psnr": float(psnr.item()),
                             "stats/keep_prob": float(keep_prob.mean().item()),
                             "stats/masked_frac": float(mae_mask.float().mean().item()),
-                            "lr": float(opt.param_groups[0]["lr"]),
-                            "time/hrs": (time.time() - t0) / 3600.0,
+                            "lr": float(model.opt.param_groups[0]["lr"]),
+                            "time/hrs": (time.monotonic() - t0) / 3600.0,
+                            "time/step_ms": step_time * 1000.0,
+                            "time/samples_per_sec": x.shape[0] * grad_accum / step_time,
                         },
                         step=step,
                     )
 
-                if is_rank0() and (step % args.print_every == 0):
+                if is_rank0() and (step % print_every == 0):
                     psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-10))
                     print(
                         f"step {step:07d} | loss={loss.item():.6f} "
                         f"| mse={mse.item():.6f} | lpips={lp.item():.4f} "
-                        f"| psnr={psnr.item():.2f} | keep={keep_prob.mean().item():.3f}"
+                        f"| psnr={psnr.item():.2f} | keep={keep_prob.mean().item():.3f} "
+                        f"| {step_time*1000:.1f}ms/step"
                     )
 
                 # ---- viz ----
-                if is_rank0() and args.viz_every > 0 and (step % args.viz_every == 0):
-                    log_tokenizer_viz_wandb(
-                        x_btchw=x,
-                        pred_btnd=pred,
-                        mae_mask_btNp1=mae_mask,
-                        patch=args.patch,
-                        step=step,
-                        max_items=args.viz_max_items,
-                        max_T=args.viz_max_T,
-                    )
+                if is_rank0() and viz_every > 0 and (step % viz_every == 0):
+                    # Free up VRAM before visualization
+                    torch.cuda.empty_cache()
+                    
+                    with torch.no_grad():
+                        patches = temporal_patchify(x, P)
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            pred, mae_mask, keep_prob = model(patches)
 
+                        log_tokenizer_viz_wandb(
+                            x_btchw=x,
+                            pred_btnd=pred,
+                            mae_mask_btNp1=mae_mask,
+                            patch=P,
+                            step=step,
+                            max_items=viz_max_items,
+                            max_T=viz_max_T,
+                        )
+                    
+                    torch.cuda.empty_cache()
+                    
                 # ---- ckpt ----
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                if is_rank0() and save_every > 0 and (step % save_every == 0):
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
-                    save_ckpt(ckpt_path, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
+                    save_ckpt(ckpt_path, step=step, epoch=epoch, model=model, args=args)
                     # also update a "latest" pointer
                     latest = ckpt_dir / "latest.pt"
-                    save_ckpt(latest, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
-
-                step += 1
+                    save_ckpt(latest, step=step, epoch=epoch, model=model, args=args)
 
             start_epoch = epoch + 1
 
@@ -376,64 +313,6 @@ def train(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
-    # data
-    p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to preprocessed frames
-        "/mnt/datasets/dreamer4/expert-shards",
-        "/mnt/datasets/dreamer4/mixed-small-shards",
-        "/mnt/datasets/dreamer4/mixed-large-shards",
-    ])
-    p.add_argument("--seq_len", type=int, default=8)
-    p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--batch_size", type=int, default=8)
-
-    # image / patching
-    p.add_argument("--H", type=int, default=128)
-    p.add_argument("--W", type=int, default=128)
-    p.add_argument("--C", type=int, default=3)
-    p.add_argument("--patch", type=int, default=4)
-
-    # model
-    p.add_argument("--d_model", type=int, default=256)
-    p.add_argument("--n_heads", type=int, default=4)
-    p.add_argument("--depth", type=int, default=8)
-    p.add_argument("--n_latents", type=int, default=16)
-    p.add_argument("--d_bottleneck", type=int, default=32)
-    p.add_argument("--dropout", type=float, default=0.05)
-    p.add_argument("--mlp_ratio", type=float, default=2.67)
-    p.add_argument("--time_every", type=int, default=1)
-    p.add_argument("--mae_p_min", type=float, default=0.0)
-    p.add_argument("--mae_p_max", type=float, default=0.9)
-
-    # optim
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-2)
-    p.add_argument("--max_steps", type=int, default=10_000_000)
-    p.add_argument("--grad_accum", type=int, default=1)
-
-    # lpips
-    p.add_argument("--lpips_weight", type=float, default=0.2)
-    p.add_argument("--lpips_frac", type=float, default=0.5)
-    p.add_argument("--lpips_net", type=str, default="alex", choices=["alex", "vgg", "squeeze"])
-
-    # logging / viz
-    p.add_argument("--log_every", type=int, default=100)
-    p.add_argument("--print_every", type=int, default=100)
-    p.add_argument("--viz_every", type=int, default=500)
-    p.add_argument("--viz_max_items", type=int, default=4)
-    p.add_argument("--viz_max_T", type=int, default=8)
-
-    # wandb
-    p.add_argument("--wandb_project", type=str, default="Dreamer")
-    p.add_argument("--wandb_run_name", type=str, default="run_01")
-    p.add_argument("--wandb_entity", type=str, default=None)
-
-    # ckpt
-    p.add_argument("--ckpt_dir", type=str, default="./logs/tokenizer_ckpts")
-    p.add_argument("--save_every", type=int, default=5_000)
-    p.add_argument("--resume", type=str, default=None)
-
-    # misc
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--compile", action="store_true")
-
+    p.add_argument("--config", type=str, default="config/project.yaml")
+   
     train(p.parse_args())

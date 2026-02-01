@@ -1,0 +1,3 @@
+seed: 0
+data: $(data.yaml)
+tokenizer: $(tokenizer.yaml)

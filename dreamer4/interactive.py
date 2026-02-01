@@ -791,7 +791,7 @@ def main():
     p.add_argument("--dynamics_ckpt", type=str, default="/mnt/datasets/dreamer4/checkpoints/dynamics.pt")
 
     # rollout
-    p.add_argument("--fps", type=float, default=10.0)
+    p.add_argument("--fps", type=float, default=60.0)
     p.add_argument("--packing_factor", type=int, default=2)
     p.add_argument("--ctx_window", type=int, default=24)
     p.add_argument("--schedule", type=str, default="shortcut", choices=["finest", "shortcut"])

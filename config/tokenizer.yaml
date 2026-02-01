@@ -1,0 +1,65 @@
+checkpoint_dir: ./logs/tokenizer_ckpts
+
+# Patch size (kernel/stride for patchifying images)
+# With H=W=128 and num_patches=8: n_patches = (128/8)^2 = 256, d_patch = 8*8*3 = 192
+# Larger patch = fewer tokens = less VRAM but coarser reconstruction
+num_patches: 8
+
+latent_dim: 256
+compile: true
+num_heads: 4
+num_layers: 8
+num_latents: 16
+bottleneck_dim: 32
+dropout: 0.05
+mlp_ratio: 2.67
+time_embedding_every: 1
+mae_prob_min: 0.0
+mae_prob_max: 0.9
+latents_only_time: true
+
+# Gradient checkpointing trades compute for memory (~40-60% activation memory savings)
+gradient_checkpointing: false
+
+mae_p_min: 0.1
+mae_p_max: 0.9
+
+optim:
+  lr: 0.0001
+  weight_decay: 0.01
+  max_steps: 10000000
+  grad_accum: 1  # Accumulate gradients to simulate larger batch with less VRAM
+
+lpips:
+  weight: 0.2
+  frac: 0.5
+  net: "alex"
+
+wandb:
+  wandb_enable: true
+  wandb_project: "Dreamer"
+  wandb_run_name: null
+  wandb_entity: null
+
+dataloader:
+  batch_size: 16
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+  persistent_workers: true
+  prefetch_factor: 10
+
+wandb:
+  mode: "online"
+  project: "Dreamer"
+  entity: null
+
+training:
+  maxsteps: 1000000
+  log_every: 100
+  print_every: 100
+  viz_every: 500
+  viz_max_items: 4
+  viz_max_T: 8
+  ckpt_dir: "./logs/tokenizer_ckpts"
+  save_every: 5000
