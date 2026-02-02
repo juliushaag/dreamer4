@@ -1,0 +1,62 @@
+# Dynamics model config
+d_model: 512
+n_heads: 4
+depth: 8
+dropout: 0.0
+mlp_ratio: 4.0
+time_every: 1
+
+packing_factor: 2
+n_register: 4
+n_agent: 1
+space_mode: wm_agent_isolated
+
+# Shortcut / schedule
+k_max: 8
+bootstrap_start: 5000
+self_fraction: 0.25
+
+# Actions
+use_actions: true
+
+optim:
+  lr: 0.0001
+  weight_decay: 0.01
+  max_steps: 10000000
+  grad_accum: 1
+  grad_clip: 1.0
+  # LR scheduler: linear warmup + cosine decay
+  warmup_steps: 1000
+  min_lr: 1.0e-6
+
+dataloader:
+  batch_size: 24
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+  persistent_workers: true
+  prefetch_factor: 4
+
+eval:
+  every: 1000
+  batch_size: 4
+  max_items: 4
+  ctx: 8
+  horizon: 16
+  schedule: shortcut
+  d: 0.25
+
+wandb:
+  mode: online
+  project: dreamer4-dynamics
+  entity: null
+
+training:
+  log_every: 200
+  print_every: 200
+  save_every: 10000
+  ckpt_dir: ./logs/dynamics_ckpts
+  compile: false
+  # Validation settings
+  val_every: 1000
+  val_max_batches: 25

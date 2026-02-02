@@ -3,9 +3,9 @@ checkpoint_dir: ./logs/tokenizer_ckpts
 # Patch size (kernel/stride for patchifying images)
 # With H=W=128 and num_patches=8: n_patches = (128/8)^2 = 256, d_patch = 8*8*3 = 192
 # Larger patch = fewer tokens = less VRAM but coarser reconstruction
-num_patches: 8
+num_patches: 4
 
-latent_dim: 256
+latent_dim: 64
 compile: true
 num_heads: 4
 num_layers: 8
@@ -27,19 +27,16 @@ mae_p_max: 0.9
 optim:
   lr: 0.0001
   weight_decay: 0.01
-  max_steps: 10000000
+  max_steps: 1000000
   grad_accum: 1  # Accumulate gradients to simulate larger batch with less VRAM
+  # LR scheduler: linear warmup + cosine decay
+  warmup_steps: 1000
+  min_lr: 1.0e-6
 
 lpips:
   weight: 0.2
   frac: 0.5
   net: "alex"
-
-wandb:
-  wandb_enable: true
-  wandb_project: "Dreamer"
-  wandb_run_name: null
-  wandb_entity: null
 
 dataloader:
   batch_size: 16
@@ -63,3 +60,7 @@ training:
   viz_max_T: 8
   ckpt_dir: "./logs/tokenizer_ckpts"
   save_every: 5000
+  # Validation settings
+  val_every: 1000
+  val_max_batches: 50
+  val_lpips_frac: 0.25
