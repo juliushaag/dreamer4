@@ -188,7 +188,7 @@ def train(args):
     H = conf.get("data/image_height", int)
     W = conf.get("data/image_width", int)
     C = 3  # RGB
-    P = conf.get("tokenizer/num_patches", int)
+    P = conf.get("tokenizer/patch_size", int)
     
     assert H % P == 0 and W % P == 0
  

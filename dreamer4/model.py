@@ -429,8 +429,8 @@ class Encoder(nn.Module):
     latents_only_time : bool = config_field("latents_only_time")
     gradient_checkpointing : bool = config_field("gradient_checkpointing")
 
-    mae_p_min : float = config_field("mae_p_min")
-    mae_p_max : float = config_field("mae_p_max")
+    mae_p_min : float = config_field("mae_prob_min")
+    mae_p_max : float = config_field("mae_prob_max")
 
     def __init__(self, n_patches: int, d_patch: int):
         super().__init__()
@@ -542,7 +542,6 @@ class Tokenizer(nn.Module):
     W : int = config_field("data/image_width")
     C : int = config_field("data/image_channels")
 
-    num_patches : int = config_field("num_patches", ge=1)
     num_latents : int = config_field("num_latents", ge=1)
 
     d_bottleneck : int = config_field("bottleneck_dim")
@@ -559,7 +558,7 @@ class Tokenizer(nn.Module):
 
     compile : bool = config_field("compile")
 
-    P : int = config_field("num_patches")  # This is actually patch_size (kernel/stride)
+    P : int = config_field("patch_size")  # This is actually patch_size (kernel/stride)
         
 
     def __init__(self, device : str):
@@ -661,7 +660,7 @@ class Tokenizer(nn.Module):
     @torch.no_grad()
     def encode(self, x : torch.Tensor):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            patches = temporal_patchify(x, self.num_patches)
+            patches = temporal_patchify(x, self.P)
             z, _ = self.encoder(patches)
         return z
 
@@ -680,7 +679,7 @@ class Tokenizer(nn.Module):
             x: Input tensor (B,T,C,H,W) - float [0,1]
             accumulate: If True, skip optimizer step (for gradient accumulation)
         """
-        patches = temporal_patchify(x, self.num_patches)
+        patches = temporal_patchify(x, self.P)
  
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred, mae_mask, keep_prob = self(patches)
@@ -690,7 +689,7 @@ class Tokenizer(nn.Module):
 
             lp = lpips_on_mae_recon(
                 self.lpips, pred, patches, mae_mask,
-                H=self.H, W=self.W, C=self.C, patch=self.num_patches,
+                H=self.H, W=self.W, C=self.C, patch=self.P,
                 subsample_frac=self.lpips_frac
             )
             loss = mse + self.lpips_weight * lp
