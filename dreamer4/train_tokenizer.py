@@ -212,6 +212,7 @@ def train(args):
             print(f"[Resume] Resumed from step {step}, epoch {start_epoch}, best_val_loss={best_val_loss:.6f}")
     else:
         model = Tokenizer(device=str(device), **conf.select("tokenizer", data="/data")).to(device)
+        model.opt = model.opt.to(device)
 
     if is_rank0():
         param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)

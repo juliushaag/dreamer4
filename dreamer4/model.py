@@ -613,7 +613,18 @@ class Tokenizer(nn.Module):
         tok = cls(device=device, **conf.select("tokenizer", data="/data"))
         tok.load_state_dict(ckpt["model"], strict=True)
         
+        # Move model to device BEFORE loading optimizer state
+        # This ensures optimizer state tensors are created on the correct device
+        # (required for fused AdamW which expects all tensors on the same device)
+        tok.to(device)
+        
         tok.opt.load_state_dict(ckpt["opt"])
+        
+        # Move optimizer state tensors to device (they were loaded on CPU)
+        for state in tok.opt.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
         
         # Restore scheduler state if present
         if "scheduler" in ckpt and ckpt["scheduler"] is not None:
@@ -960,7 +971,18 @@ class Dynamics(nn.Module):
         
         dyn.load_state_dict(ckpt["dynamics"], strict=True)
         
+        # Move model to device BEFORE loading optimizer state
+        # This ensures optimizer state tensors are created on the correct device
+        # (required for fused AdamW which expects all tensors on the same device)
+        dyn.to(device)
+        
         dyn.opt.load_state_dict(ckpt["opt"])
+        
+        # Move optimizer state tensors to device (they were loaded on CPU)
+        for state in dyn.opt.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
         
         # Restore scheduler state if present
         if "scheduler" in ckpt and ckpt["scheduler"] is not None:
