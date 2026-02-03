@@ -33,7 +33,7 @@ lpips:
   net: "alex"
 
 dataloader:
-  batch_size: 24
+  batch_size: 30
   num_workers: 8
   pin_memory: true
   drop_last: true
