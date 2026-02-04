@@ -16,7 +16,8 @@ import einops
 import wandb
 
 from miniconf import MiniConf
-from wm_dataset import WMDataset, collate_batch, split_by_trajectory
+from datasets.robocasa_dataset import RoboCasaDataset
+from datasets.wm_dataset import DMCDataset , collate_batch, split_by_trajectory
 from model import (
     Tokenizer,
     Dynamics,
@@ -468,7 +469,15 @@ def train(args):
     seed_everything(conf.get("seed", int) + rank)
 
     # ---- data ----
-    dataset = WMDataset(**conf.select("data"))
+    
+    # ---- data ----
+    ds_name = conf.select("dataset") 
+    if ds_name == "robocasa":
+        dataset = RoboCasaDataset(**conf.select("robocasa_data"))
+    elif ds_name == "dmc":
+        dataset = DMCDataset(**conf.select("dmc_data"))
+    else:
+        raise ValueError(f"Invalid dataset specified {ds_name}")
     
     # Split by trajectory (respects episode boundaries) - same as tokenizer
     try:

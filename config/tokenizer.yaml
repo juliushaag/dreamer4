@@ -1,12 +1,12 @@
 checkpoint_dir: ./logs/tokenizer_ckpts
 
-patch_size: 4
+patch_size: 8
 
-latent_dim: 64
-compile: true
-num_heads: 4
-num_layers: 8
-num_latents: 16
+latent_dim: 384
+compile: True 
+num_heads: 8
+num_layers: 12
+num_latents: 32
 bottleneck_dim: 32
 dropout: 0.05
 mlp_ratio: 2.67
@@ -15,16 +15,14 @@ mae_prob_min: 0.0
 mae_prob_max: 0.9
 latents_only_time: true
 
-# Gradient checkpointing trades compute for memory (~40-60% activation memory savings)
-gradient_checkpointing: false
+gradient_checkpointing: false  # Enable to save memory
 
 optim:
-  lr: 0.0001
+  lr: 0.0003  
   weight_decay: 0.01
-  max_steps: 1000000
-  grad_accum: 1  # Accumulate gradients to simulate larger batch with less VRAM
-  # LR scheduler: linear warmup + cosine decay
-  warmup_steps: 1000
+  max_steps: 2000
+  grad_accum: 2  
+  warmup_steps: 2000
   min_lr: 1.0e-6
 
 lpips:
@@ -33,7 +31,7 @@ lpips:
   net: "alex"
 
 dataloader:
-  batch_size: 30
+  batch_size: 8  
   num_workers: 8
   pin_memory: true
   drop_last: true

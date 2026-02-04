@@ -1,0 +1,67 @@
+# RoboCasa dataset configuration
+# Used with RoboCasaDataset loader
+
+image_height: 128
+image_width: 128
+image_channels: 3
+
+sequence_length: 16
+
+# Train/val split fraction (respects trajectory boundaries)
+val_fraction: 0.1
+
+# Root directory of RoboCasa dataset
+data_root: /mnt/datasets/robocasa/v0.1
+
+# LRU cache size in MB for demo data
+cache_mb: 2048
+
+# HDF5 file to load (options: demo_gentex_im128_randcams.hdf5, demo_im128.hdf5, demo.hdf5)
+hdf5_key: demo_gentex_im128_randcams.hdf5
+
+# Camera view to use for observations
+# Options: robot0_agentview_left_image, robot0_agentview_right_image, robot0_eye_in_hand_image
+image_key: robot0_agentview_left_image
+
+# Action representation
+# Options: actions (relative), actions_abs (absolute)
+action_key: actions
+
+# Task list - use ["all"] to load all available tasks
+# Format: category/task_name (e.g., kitchen_pnp/PnPCabToCounter)
+tasks:
+  - all
+
+# Available single-stage tasks:
+#   - kitchen_sink/TurnSinkSpout
+#   - kitchen_sink/TurnOnSinkFaucet
+#   - kitchen_sink/TurnOffSinkFaucet
+#   - kitchen_pnp/PnPCounterToSink
+#   - kitchen_pnp/PnPCabToCounter
+#   - kitchen_pnp/PnPSinkToCounter
+#   - kitchen_pnp/PnPMicrowaveToCounter
+#   - kitchen_pnp/PnPCounterToStove
+#   - kitchen_pnp/PnPCounterToMicrowave
+#   - kitchen_pnp/PnPStoveToCounter
+#   - kitchen_pnp/PnPCounterToCab
+#   - kitchen_doors/OpenDoubleDoor
+#   - kitchen_doors/CloseSingleDoor
+#   - kitchen_doors/CloseDoubleDoor
+#   - kitchen_doors/OpenSingleDoor
+#   - kitchen_coffee/CoffeeSetupMug
+#   - kitchen_coffee/CoffeeServeMug
+#   - kitchen_coffee/CoffeePressButton
+#   - kitchen_drawer/OpenDrawer
+#   - kitchen_drawer/CloseDrawer
+#   - kitchen_stove/TurnOnStove
+#   - kitchen_stove/TurnOffStove
+#   - kitchen_microwave/TurnOnMicrowave
+#   - kitchen_microwave/TurnOffMicrowave
+#   - kitchen_navigate/NavigateKitchen
+
+# Available multi-stage tasks:
+#   - washing_dishes/PreSoakPan
+#   - chopping_food/ArrangeVegetables
+#   - restocking_supplies/RestockPantry
+#   - defrosting_food/MicrowaveThawing
+#   - brewing/PrepareCoffee

@@ -1,4 +1,9 @@
 seed: 0
-data: $(data.yaml)
+
+dmc_data: $(dmc_data.yaml)
+robocasa_data: $(robocasa_data.yaml)
+
+dataset: robocasa
+
 tokenizer: $(tokenizer.yaml)
 dynamics: $(dynamics.yaml)

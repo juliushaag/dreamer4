@@ -13,7 +13,8 @@ import einops
 
 import wandb
 
-from wm_dataset import WMDataset, collate_batch, split_by_trajectory
+from datasets.robocasa_dataset import RoboCasaDataset, split_by_trajectory as robocasa_split
+from datasets.wm_dataset import DMCDataset, collate_batch, split_by_trajectory as dmc_split
 from model import (
     Tokenizer,
     temporal_patchify, temporal_unpatchify,
@@ -153,14 +154,26 @@ def train(args):
     seed_everything(conf.get("seed", int) + rank)
 
     # ---- data ----
-    dataset = WMDataset(**conf.select("data"))
+    ds_name = conf.get("dataset")
+    if ds_name == "robocasa":
+        dataset = RoboCasaDataset(**conf.select("robocasa_data"))
+    elif ds_name == "dmc":
+        dataset = DMCDataset(**conf.select("dmc_data"))
+    else:
+        raise ValueError(f"Invalid dataset specified {ds_name}")
+    
     
     # Split by trajectory (respects episode boundaries)
     try:
         val_fraction = conf.get("data/val_fraction", float)
     except KeyError:
         val_fraction = 0.1
-    train_dataset, val_dataset = split_by_trajectory(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
+    
+    # Use appropriate split function based on dataset type
+    if ds_name == "robocasa":
+        train_dataset, val_dataset = robocasa_split(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
+    else:
+        train_dataset, val_dataset = dmc_split(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
     
     if is_rank0():
         print(f"[Data] Train: {len(train_dataset):,} sequences, Val: {len(val_dataset):,} sequences")
@@ -185,8 +198,10 @@ def train(args):
     )
 
     # ---- model ----
-    H = conf.get("data/image_height", int)
-    W = conf.get("data/image_width", int)
+    # Get image dimensions from the appropriate data config
+    data_config_key = f"{ds_name}_data" if ds_name != "dmc" else "dmc_data"
+    H = conf.get(f"{data_config_key}/image_height", int)
+    W = conf.get(f"{data_config_key}/image_width", int)
     C = 3  # RGB
     P = conf.get("tokenizer/patch_size", int)
     
@@ -211,8 +226,9 @@ def train(args):
         if is_rank0():
             print(f"[Resume] Resumed from step {step}, epoch {start_epoch}, best_val_loss={best_val_loss:.6f}")
     else:
-        model = Tokenizer(device=str(device), **conf.select("tokenizer", data="/data")).to(device)
-        model.opt = model.opt.to(device)
+        # Map "data" namespace to the appropriate data config based on dataset
+        data_ns_path = f"/{data_config_key}"
+        model = Tokenizer(device=str(device), **conf.select("tokenizer", data=data_ns_path)).to(device)
 
     if is_rank0():
         param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)

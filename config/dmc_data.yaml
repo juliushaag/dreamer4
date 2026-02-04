@@ -2,6 +2,7 @@ image_height: 128
 image_width: 128
 image_channels: 3
 
+strict_tasks: true
 sequence_length: 16
 
 # Train/val split fraction (respects trajectory boundaries)
@@ -18,6 +19,9 @@ raw:
   - /mnt/datasets/dreamer4/expert
   - /mnt/datasets/dreamer4/mixed-small
   - /mnt/datasets/dreamer4/mixed-large 
+
+task_json_file:
+  - /mnt/datasets/dreamer4/tasks.json
 
 tasks:
     - walker-stand

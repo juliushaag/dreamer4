@@ -12,7 +12,6 @@ import glob
 import json
 import bisect
 import logging
-from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -20,11 +19,13 @@ import torch
 from torch.utils.data import Dataset
 from miniconf import configclass, config_field
 
+from .dataset_utils import DemoCache, TrajectorySubset, collate_batch
+
 logger = logging.getLogger(__name__)
 
 
 @configclass
-class WMDataset(Dataset):
+class DMCDataset(Dataset):
     """Unified dataset for world model training with actions."""
     
     # Config fields - paths
@@ -41,8 +42,8 @@ class WMDataset(Dataset):
     # Config fields - data loading
     shard_size: int = 2048
     cache_mb: int = 2048
-    strict_tasks: bool = False
-    tasks_json: str = "../tasks.json"
+    strict_tasks: bool = config_field("strict_tasks")
+    tasks_json: str = config_field("task_json_file")
 
     def __init__(self, verbose: bool = True):
         super().__init__()
@@ -84,8 +85,7 @@ class WMDataset(Dataset):
         self._zero_lang = torch.zeros(self.lang_dim, dtype=torch.float32)
         
         # LRU cache for shards
-        self._cache = OrderedDict()
-        self._cache_nbytes = 0
+        self._cache = DemoCache(max_bytes=self.cache_bytes)
         
         # Discover available tasks from data_dirs
         found_tasks = []
@@ -325,24 +325,9 @@ class WMDataset(Dataset):
         start = int(self.valid_starts[task_idx][local].item())
         return task_idx, start
 
-    def _cache_get(self, key):
-        if key in self._cache:
-            v = self._cache.pop(key)
-            self._cache[key] = v
-            return v
-        return None
-
-    def _cache_put(self, key, tensor):
-        nbytes = tensor.nbytes
-        while self._cache_nbytes + nbytes > self.cache_bytes and len(self._cache) > 0:
-            _, v = self._cache.popitem(last=False)
-            self._cache_nbytes -= v.nbytes
-        self._cache[key] = tensor
-        self._cache_nbytes += nbytes
-
     def _load_shard_frames(self, task_idx: int, seg_idx: int, shard_idx: int) -> torch.Tensor:
         key = (task_idx, seg_idx, shard_idx)
-        cached = self._cache_get(key)
+        cached = self._cache.get(key)
         if cached is not None:
             return cached
 
@@ -366,7 +351,7 @@ class WMDataset(Dataset):
         if frames.shape[-2] != self.H or frames.shape[-1] != self.W:
             raise RuntimeError(f"Shard frame size mismatch: {tuple(frames.shape[-2:])} != {(self.H, self.W)}")
 
-        self._cache_put(key, frames)
+        self._cache.put(key, frames)
         return frames
 
     def _get_frames(self, task_idx: int, start: int, length: int) -> torch.Tensor:
@@ -423,30 +408,11 @@ class WMDataset(Dataset):
         }
 
 
-def collate_batch(batch):
-    out = {}
-    for k in batch[0].keys():
-        out[k] = torch.stack([b[k] for b in batch], dim=0)
-    return out
+# Re-export collate_batch for backward compatibility
+# (already imported from dataset_utils at top of file)
 
 
-class TrajectorySubset(Dataset):
-    """
-    A subset of a WMDataset that only includes specific indices.
-    Used for train/val splits that respect trajectory boundaries.
-    """
-    def __init__(self, dataset: WMDataset, indices: torch.Tensor):
-        self.dataset = dataset
-        self.indices = indices
-    
-    def __len__(self):
-        return len(self.indices)
-    
-    def __getitem__(self, idx: int):
-        return self.dataset[int(self.indices[idx].item())]
-
-
-def split_by_trajectory(dataset: WMDataset, val_fraction: float = 0.1, seed: int = 42) -> tuple:
+def split_by_trajectory(dataset: DMCDataset, val_fraction: float = 0.1, seed: int = 42) -> tuple:
     """
     Split a WMDataset into train and validation sets, respecting trajectory boundaries.
     
@@ -513,7 +479,7 @@ if __name__ == "__main__":
     conf = MiniConf.load('../config/project.yaml')
     print('Config loaded')
     
-    ds = WMDataset(**conf.select('data'))
+    ds = DMCDataset(**conf.select('data'))
     print(f'Dataset length: {len(ds)}')
     
     if len(ds) > 0:
