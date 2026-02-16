@@ -9,9 +9,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
-from einops import rearrange
+from einops import rearrange, repeat
 from miniconf import configclass, MiniConf, config_field
 import lpips
+
+from attention import MultiheadSelfAttention, GroupedQueryAttention
 
 
 # =============================================================================
@@ -113,31 +115,6 @@ def temporal_unpatchify(patches_btnd: torch.Tensor, H: int, W: int, C: int, patc
     out = F.fold(x, output_size=(H, W), kernel_size=patch, stride=patch)  # (BT, C, H, W)
     return rearrange(out, '(b t) c h w -> b t c h w', b=B, t=T)
 
-def _sinusoid_table_cached(n: int, d: int, base: float, device_str: str) -> torch.Tensor:
-    """Cached sinusoidal position table computation."""
-    device = torch.device(device_str)
-    pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)  # (n,1)
-    i   = torch.arange(d, device=device, dtype=torch.float32).unsqueeze(0)  # (1,d)
-    k   = torch.floor(i / 2.0)
-    div = torch.exp(-(2.0 * k) / max(1.0, float(d)) * math.log(base))
-    ang = pos * div
-    return torch.where((i % 2) == 0, torch.sin(ang), torch.cos(ang))  # (n,d) fp32
-
-
-def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None) -> torch.Tensor:
-    device_str = str(device) if device is not None else "cpu"
-    return _sinusoid_table_cached(n, d, base, device_str)
-
-
-def add_sinusoidal_positions(tokens_btSd: torch.Tensor) -> torch.Tensor:
-    B, T, S, D = tokens_btSd.shape
-    device = tokens_btSd.device
-    pos_t = sinusoid_table(T, D, device=device)  # fp32
-    pos_s = sinusoid_table(S, D, device=device)  # fp32
-    pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :]) * (1.0 / math.sqrt(D))
-    return tokens_btSd + pos.to(dtype=tokens_btSd.dtype)
-
-
 class MAEReplacer(nn.Module):
     def __init__(self, d_model: int, p_min: float = 0.0, p_max: float = 0.9):
         super().__init__()
@@ -172,19 +149,6 @@ class MAEReplacer(nn.Module):
         mae_mask = (~keep_).to(torch.bool)
         return replaced, mae_mask, keep_prob
 
-
-class RMSNorm(nn.Module):
-    """RMSNorm with optional fused implementation (PyTorch 2.4+)."""
-    def __init__(self, d: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.d = d
-        self.scale = nn.Parameter(torch.ones(d))
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(x, (self.d,), self.scale, self.eps)
-
-
 class MLP(nn.Module):
     def __init__(self, d_model: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
@@ -201,58 +165,34 @@ class MLP(nn.Module):
         y = self.drop(y)
         return y
 
-
-class MultiheadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0, qkv_bias: bool = False):
-        super().__init__()
-        assert d_model % n_heads == 0
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.dropout_p = float(dropout)
-
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
-        self.out = nn.Linear(d_model, d_model, bias=True)
-
-    def forward(self, x_nld: torch.Tensor, *, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False):
-        """
-        x: (N,L,D)
-        attn_mask: bool, True means "allowed to attend" (for torch SDPA), broadcastable to (N,1,L,L) or (N,H,L,L)
-        """
-        N, L, D = x_nld.shape
-        # Fused reshape: directly to (N, L, 3, H, head_dim) then unbind
-        qkv = self.qkv(x_nld).view(N, L, 3, self.n_heads, self.head_dim)
-        # Unbind and transpose in one step using permute for better memory access
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, N, H, L, head_dim)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # Views, no copy
-
-        drop = self.dropout_p if self.training else 0.0
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=is_causal)
-        y = y.transpose(1, 2).reshape(N, L, D)  # reshape instead of view after transpose
-        return self.out(y)
-
-
+@configclass
 class SpaceSelfAttentionModality(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, modality_ids: torch.Tensor, n_latents: int, mode: str, dropout: float):
+    attention_type: str = config_field("attention/type")
+    n_latents: float = config_field("num_latents")
+    d_model: float = config_field("latent_dim")
+
+    def __init__(self, modality_ids: torch.Tensor, mode: str):
         super().__init__()
-        self.n_latents = int(n_latents)
+
         self.mode = mode
         self.register_buffer("modality_ids", modality_ids.to(torch.int32), persistent=False)
 
         S = int(self.modality_ids.numel())
-        allow = self._build_allow(S)                               # (S,S) True=allowed
-        attn_mask = allow.unsqueeze(0).unsqueeze(0)                # (1,1,S,S) True=allowed (PyTorch SDPA bool mask)
+        allow = self._build_allow(S)
+        attn_mask = allow.unsqueeze(0).unsqueeze(0)
         self.register_buffer("attn_mask", attn_mask, persistent=False)
 
-        # Note: use self.attn_mask buffer in forward, not a separate attribute
         self._use_mask = self.mode not in ("wm_agent",)
 
-        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
-
+        if self.attention_type == "MHA":
+            self.attn = MultiheadSelfAttention(self.d_model, **self._config.select("attention"))
+        elif self.attention_type == "GQA":
+            self.attn = GroupedQueryAttention(self.d_model, **self._config.select("attention"))
+    
     def _build_allow(self, S: int) -> torch.Tensor:
         device = self.modality_ids.device
-        q_idx = torch.arange(S, device=device).unsqueeze(1)  # (S,1)
-        k_idx = torch.arange(S, device=device).unsqueeze(0)  # (1,S)
+        q_idx = torch.arange(S, device=device).unsqueeze(1)
+        k_idx = torch.arange(S, device=device).unsqueeze(0)
 
         is_q_lat = q_idx < self.n_latents
         is_k_lat = k_idx < self.n_latents
@@ -272,22 +212,14 @@ class SpaceSelfAttentionModality(nn.Module):
             return torch.where(is_q_lat, allow_lat_q, allow_nonlat_q)
 
         if self.mode == "wm_agent":
-            # full mixing across modalities
             return torch.ones((S, S), dtype=torch.bool, device=device)
 
         if self.mode == "wm_agent_isolated":
-            # non-agent tokens: can attend to everything EXCEPT agent tokens
-            # agent tokens: attend only to agent tokens (keeps them inert in pretrain)
             is_q_agent = (q_mod == int(Modality.AGENT))
             is_k_agent = (k_mod == int(Modality.AGENT))
-
             allow = torch.ones((S, S), dtype=torch.bool, device=device)
-
-            # non-agent queries cannot see agent keys
             allow_non_agent_q = ~is_q_agent
             allow = torch.where(allow_non_agent_q, ~is_k_agent, allow)
-
-            # agent queries only see agent keys
             allow = torch.where(is_q_agent, is_k_agent, allow)
             return allow
 
@@ -295,19 +227,25 @@ class SpaceSelfAttentionModality(nn.Module):
 
     def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
         B, T, S, D = x_btSd.shape
-        x = x_btSd.reshape(B * T, S, D)
-        # Use registered buffer (moves with model to correct device)
+        x = rearrange(x_btSd, 'b t s d -> (b t) s d')
         mask = self.attn_mask if self._use_mask else None
         y = self.attn(x, attn_mask=mask, is_causal=False)
-        return y.reshape(B, T, S, D)
+        return rearrange(y, '(b t) s d -> b t s d', b=B, t=T)
 
-
+@configclass
 class TimeSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float, latents_only: bool, n_latents: int):
-        super().__init__()
-        self.latents_only = bool(latents_only)
-        self.n_latents = int(n_latents)
-        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
+    attention_type: str = config_field("attention/type")
+    latents_only: bool = config_field("latents_only_time")
+    n_latents: float = config_field("num_latents")
+    d_model: float = config_field("latent_dim")
+
+    def __init__(self):
+        super().__init__()   
+      
+        if self.attention_type == "MHA":
+            self.attn = MultiheadSelfAttention(self.d_model, **self._config.select("attention"))
+        elif self.attention_type == "GQA":
+            self.attn = GroupedQueryAttention(self.d_model, **self._config.select("attention"))
 
         self.forward = self.forward_latents_only if self.latents_only else self.forward_latents_all
 
@@ -320,47 +258,38 @@ class TimeSelfAttention(nn.Module):
     def forward_latents_only(self, x_btSd: torch.Tensor):
         B, T, S, D = x_btSd.shape
         L = self.n_latents
-        # Extract latents and reshape for temporal attention
         lat = rearrange(x_btSd[:, :, :L, :], 'b t l d -> (b l) t d')
         out = self.attn(lat, is_causal=True)
         out = rearrange(out, '(b l) t d -> b t l d', b=B, l=L)
-        # In-place update for the latent portion (avoids full tensor clone)
-        # Create output tensor by concatenating updated latents with unchanged rest
         return torch.cat([out, x_btSd[:, :, L:, :]], dim=2)
 
+@configclass
 class BlockCausalLayer(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        n_latents: int,
-        modality_ids: torch.Tensor,
-        space_mode: str,
-        dropout: float,
-        mlp_ratio: float,
-        layer_index: int,
-        time_every: int,
-        latents_only_time: bool,
-    ):
+    d_model: int = config_field("latent_dim")
+    time_every: float = config_field("time_embedding_every")
+    mlp_ratio: float = config_field("mlp_ratio")
+    dropout: float = config_field("dropout")
+    
+    def __init__(self, layer_index : int, modality_ids: torch.Tensor, space_mode: str):
         super().__init__()
-        self.do_time = ((layer_index + 1) % time_every == 0)
+        self.do_time = ((layer_index + 1) % self.time_every == 0)
 
         self.res1 = nn.Sequential(
-            RMSNorm(d_model),
-            SpaceSelfAttentionModality(d_model, n_heads, modality_ids, n_latents, space_mode, dropout),
-            nn.Dropout(dropout, True)
+            nn.RMSNorm(self.d_model),
+            SpaceSelfAttentionModality(modality_ids, space_mode, **self._config.select()),
+            nn.Dropout(self.dropout, True)
         )
 
         self.res2 = nn.Identity() if not self.do_time else nn.Sequential(
-            RMSNorm(d_model),
-            TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents),
-            nn.Dropout(dropout, True),
+            nn.RMSNorm(self.d_model),
+            TimeSelfAttention(**self._config.select()),
+            nn.Dropout(self.dropout, True),
         )
         
         self.res3 = nn.Sequential(
-            RMSNorm(d_model),
-            MLP(d_model, mlp_ratio=mlp_ratio, dropout=dropout),
-            nn.Dropout(dropout, True),
+            nn.RMSNorm(self.d_model),
+            MLP(self.d_model, mlp_ratio=self.mlp_ratio, dropout=self.dropout),
+            nn.Dropout(self.dropout, True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -371,87 +300,106 @@ class BlockCausalLayer(nn.Module):
         return x
 
 
+@configclass
+class ParallelBlockCausalLayer(nn.Module):
+    d_model: int = config_field("latent_dim")
+    time_every: float = config_field("time_embedding_every")
+    mlp_ratio: float = config_field("mlp_ratio")
+    dropout: float = config_field("dropout")
+    parallel_alpha: float = config_field("parallel_alpha")
+    parallel_beta: float = config_field("parallel_beta")
+    
+    def __init__(self, layer_index : int, modality_ids: torch.Tensor, space_mode: str):
+        super().__init__()
+        self.do_time = ((layer_index + 1) % self.time_every == 0)
+
+        self.norm = nn.RMSNorm(self.d_model)
+        
+        self.space_attn = nn.Sequential(
+            SpaceSelfAttentionModality(modality_ids, space_mode, **self._config.select()),
+            nn.Dropout(self.dropout, True)
+        )
+        
+        self.time_attn = nn.Identity() if not self.do_time else nn.Sequential(
+            TimeSelfAttention(**self._config.select()),
+            nn.Dropout(self.dropout, True),
+        )
+        
+        self.mlp = nn.Sequential(
+            MLP(self.d_model, mlp_ratio=self.mlp_ratio, dropout=self.dropout),
+            nn.Dropout(self.dropout, True),
+        )
+        
+        self.attn_scale = nn.Parameter(torch.tensor(self.parallel_alpha))
+        self.mlp_scale = nn.Parameter(torch.tensor(self.parallel_beta))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_norm = self.norm(x)
+        
+        attn_out = self.space_attn(x_norm)
+        if self.do_time:
+            attn_out = attn_out + self.time_attn(x_norm)
+            
+        mlp_out = self.mlp(x_norm)
+        
+        x = x + self.attn_scale * attn_out + self.mlp_scale * mlp_out
+        return x
+
+
+@configclass
 class BlockCausalTransformer(nn.Module):
-    """Sequential stack of BlockCausalLayer modules with optional gradient checkpointing."""
+    gradient_checkpointing : bool = config_field("gradient_checkpointing")
+    depth : int = config_field("num_layers")
+
     def __init__(
         self,
-        d_model: int,
-        n_heads: int,
-        depth: int,
-        n_latents: int,
         modality_ids: torch.Tensor,
         space_mode: str,
-        dropout: float,
-        mlp_ratio: float,
-        time_every: int,
-        latents_only_time: bool,
-        gradient_checkpointing: bool = False,
     ):
         super().__init__()
-        self.gradient_checkpointing = gradient_checkpointing
         self.layers = nn.Sequential(*[
-            BlockCausalLayer(
-                d_model=d_model,
-                n_heads=n_heads,
-                n_latents=n_latents,
+            ParallelBlockCausalLayer(
+                layer_index=i,
                 modality_ids=modality_ids,
                 space_mode=space_mode,
-                dropout=dropout,
-                mlp_ratio=mlp_ratio,
-                layer_index=i,
-                time_every=time_every,
-                latents_only_time=latents_only_time,
+                **self._config.select()
             )
-            for i in range(depth)
+            for i in range(self.depth)
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.gradient_checkpointing and self.training:
-            # Checkpoint each layer to trade compute for memory
             for layer in self.layers:
                 x = grad_checkpoint(layer, x, use_reentrant=False)
             return x
         return self.layers(x)
 
+
 @configclass
 class Encoder(nn.Module):
-    depth : int = config_field("num_layers")
-    n_heads : int = config_field("num_heads")
     d_model : int = config_field("latent_dim")
     d_bottleneck : int = config_field("bottleneck_dim")
-
     n_latents : int = config_field("num_latents")
-
-    mlp_ratio : float = config_field("mlp_ratio")
-    dropout : float = config_field("dropout")
-    time_every : int = config_field("time_embedding_every")
-
-    latents_only_time : bool = config_field("latents_only_time")
-    gradient_checkpointing : bool = config_field("gradient_checkpointing")
 
     mae_p_min : float = config_field("mae_prob_min")
     mae_p_max : float = config_field("mae_prob_max")
 
+
     def __init__(self, n_patches: int, d_patch: int):
         super().__init__()
 
-        self.n_patches = n_patches  # number of spatial patches
-        self.d_patch = d_patch      # dimension of each patch (P*P*C)
-
-        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        self.n_patches = n_patches
+        self.d_patch = d_patch
 
         self.patch_proj = nn.Linear(self.d_patch, self.d_model)
         self.bottleneck_proj = nn.Linear(self.d_model, self.d_bottleneck)
 
         self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
-        modality_ids = self.layout.modality_ids()  # CPU buffer, moves with .to(device)
+        modality_ids = self.layout.modality_ids()
 
         self.transformer = BlockCausalTransformer(
-            d_model=self.d_model, n_heads=self.n_heads, depth=self.depth,
-            n_latents=self.n_latents, modality_ids=modality_ids, space_mode="encoder",
-            dropout=self.dropout, mlp_ratio=self.mlp_ratio,
-            time_every=self.time_every, latents_only_time=self.latents_only_time,
-            gradient_checkpointing=self.gradient_checkpointing,
+            modality_ids=modality_ids, space_mode="encoder",
+            **self._config.select(),
         )
 
         self.mae = MAEReplacer(d_model=self.d_model, p_min=self.mae_p_min, p_max=self.mae_p_max)
@@ -460,17 +408,14 @@ class Encoder(nn.Module):
         nn.init.normal_(self.latents, std=0.02)
 
     def forward(self, patch_tokens_btnd: torch.Tensor):
-
         B, T, Np, Dp = patch_tokens_btnd.shape
-        assert Np == self.n_patches
-        assert Dp == self.d_patch
+        
+        proj = self.patch_proj(patch_tokens_btnd)
+        proj_masked, mae_mask, keep_prob = self.mae(proj)
 
-        proj = self.patch_proj(patch_tokens_btnd)            # (B,T,Np,D)
-        proj_masked, mae_mask, keep_prob = self.mae(proj)    # (B,T,Np,D), (B,T,Np,1), (B,T,1)
+        lat = repeat(self.latents, 'l d -> b t l d', b=B, t=T)
+        tokens = torch.cat([lat, proj_masked], dim=2)
 
-        lat = self.latents.view(1, 1, self.n_latents, -1).expand(B, T, -1, -1)
-        tokens = torch.cat([lat, proj_masked], dim=2)        # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
 
         enc = self.transformer(tokens)
         z = torch.tanh(self.bottleneck_proj(enc[:, :, :self.n_latents, :]))
@@ -480,28 +425,15 @@ class Encoder(nn.Module):
 @configclass
 class Decoder(nn.Module):
 
-    depth : int = config_field("num_layers")
-    n_heads : int = config_field("num_heads")
     d_model : int = config_field("latent_dim")
     d_bottleneck : int = config_field("bottleneck_dim")
-
     n_latents : int = config_field("num_latents")
-
-    mlp_ratio : float = config_field("mlp_ratio")
-    dropout : float = config_field("dropout")
-    time_every : int = config_field("time_embedding_every")
-
-    latents_only_time : bool = config_field("latents_only_time")
-    gradient_checkpointing : bool = config_field("gradient_checkpointing")
 
     def __init__(self, n_patches: int, d_patch: int):
         super().__init__()
 
-        self.n_patches = n_patches  # number of spatial patches
-        self._d_patch = d_patch     # dimension of each patch (P*P*C)
-
-        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
-
+        self.n_patches = n_patches
+        self._d_patch = d_patch
 
         self.up_proj = nn.Linear(self.d_bottleneck, self.d_model)
         self.patch_queries = nn.Parameter(torch.empty(self.n_patches, self.d_model))
@@ -513,27 +445,20 @@ class Decoder(nn.Module):
         modality_ids = self.layout.modality_ids()
 
         self.transformer = BlockCausalTransformer(
-            d_model=self.d_model, n_heads=self.n_heads, depth=self.depth,
-            n_latents=self.n_latents, modality_ids=modality_ids, space_mode="decoder",
-            dropout=self.dropout, mlp_ratio=self.mlp_ratio,
-            time_every=self.time_every, latents_only_time=self.latents_only_time,
-            gradient_checkpointing=self.gradient_checkpointing,
+            modality_ids=modality_ids, space_mode="decoder",
+            **self._config.select()
         )
-
-
 
     def forward(self, z_btLd: torch.Tensor) -> torch.Tensor:
         B, T, L, _ = z_btLd.shape
-        assert L == self.n_latents
-
-        lat = torch.tanh(self.up_proj(z_btLd))                                 # (B,T,L,D)
-        qry = self.patch_queries.view(1, 1, self.n_patches, -1).expand(B, T, -1, -1)
-        tokens = torch.cat([lat, qry], dim=2)                                  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
+        
+        lat = torch.tanh(self.up_proj(z_btLd))
+        qry = repeat(self.patch_queries, 'p d -> b t p d', b=B, t=T)
+        tokens = torch.cat([lat, qry], dim=2)
 
         x = self.transformer(tokens)
         x_p = x[:, :, L:, :]
-        return torch.sigmoid(self.patch_head(x_p))                             # (B,T,Np,Dp)
+        return torch.sigmoid(self.patch_head(x_p))
 
 @configclass
 class Tokenizer(nn.Module):
@@ -610,7 +535,10 @@ class Tokenizer(nn.Module):
         config = ckpt["config"]
         
         conf = MiniConf(config)  
-        tok = cls(device=device, **conf.select("tokenizer", data="/data"))
+        
+        ds_name = conf.get("dataset")
+        data_config_key = f"{ds_name}_data" if ds_name != "dmc" else "dmc_data"
+        tok = cls(device=device, **conf.select("tokenizer", data=data_config_key))
         tok.load_state_dict(ckpt["model"], strict=True)
         
         # Move model to device BEFORE loading optimizer state
@@ -714,23 +642,14 @@ class Tokenizer(nn.Module):
         return loss, mse, lp, keep_prob, mae_mask
 
 def pack_bottleneck_to_spatial(z_btLd: torch.Tensor, *, n_spatial: int, k: int) -> torch.Tensor:
-    """
-    z: (B,T,L,D_b) where L == n_spatial * k
-    -> (B,T,n_spatial,D_b*k)
-    """
     B, T, L, D = z_btLd.shape
-    assert L == n_spatial * k, f"L={L} must equal n_spatial*k={n_spatial*k}"
-    return z_btLd.view(B, T, n_spatial, k * D)
+    return rearrange(z_btLd, 'b t (n k) d -> b t n (k d)', n=n_spatial, k=k)
 
 
 def unpack_spatial_to_bottleneck(z_btSd: torch.Tensor, *, k: int) -> torch.Tensor:
-    """
-    z: (B,T,n_spatial,D_b*k) -> (B,T,n_spatial*k,D_b)
-    """
     B, T, S, DK = z_btSd.shape
-    assert DK % k == 0, f"D={DK} must be divisible by k={k}"
     D = DK // k
-    return z_btSd.view(B, T, S * k, D)
+    return rearrange(z_btSd, 'b t n (k d) -> b t (n k) d', k=k)
 
 
 class ActionEncoder(nn.Module):
@@ -755,22 +674,20 @@ class ActionEncoder(nn.Module):
 
     def forward(
         self,
-        actions: Optional[torch.Tensor],                 # (B,T,A) or None
+        actions: Optional[torch.Tensor],
         *,
         batch_time_shape: Optional[Tuple[int,int]] = None,
-        act_mask: Optional[torch.Tensor] = None,         # (B,T,A) or (A,)
+        act_mask: Optional[torch.Tensor] = None,
         as_tokens: bool = True,
     ) -> torch.Tensor:
         if actions is None:
             assert batch_time_shape is not None
             B, T = batch_time_shape
-            out = self.base.view(1, 1, -1).expand(B, T, -1)
+            out = repeat(self.base, 'd -> b t d', b=B, t=T)
         else:
-            x = actions
-            if act_mask is not None:
-                x = x * act_mask
+            x = actions * act_mask if act_mask is not None else actions
             x = x.clamp(-1, 1)
-            out = self.fc2(F.silu(self.fc1(x))) + self.base.view(1, 1, -1)
+            out = self.fc2(F.silu(self.fc1(x))) + self.base
 
         return out[:, :, None, :] if as_tokens else out
 
@@ -802,13 +719,9 @@ class TaskEmbedder(nn.Module):
         nn.init.normal_(self.agent_base, std=0.02)
 
     def forward(self, task: torch.Tensor, *, B: int, T: int) -> torch.Tensor:
-        if self.use_ids:
-            emb = self.task_table(task.to(torch.long))  # (B,D)
-        else:
-            emb = self.task_proj(task)                  # (B,D)
-
-        x = emb + self.agent_base.view(1, -1)          # (B,D)
-        return x[:, None, None, :].expand(B, T, self.n_agent, self.d_model)
+        emb = self.task_table(task) if self.use_ids else self.task_proj(task)
+        x = emb + self.agent_base
+        return repeat(x, 'b d -> b t n d', t=T, n=self.n_agent)
 
 
 def _emax_from_kmax(k_max: int) -> int:
@@ -848,6 +761,13 @@ class Dynamics(nn.Module):
     mlp_ratio: float = config_field("mlp_ratio")
     time_every: int = config_field("time_every")
     space_mode: str = config_field("space_mode")
+
+    # Attention config
+    attention_type: str = config_field("attention_type")
+    n_kv_heads: int = config_field("n_kv_heads")
+    rope_base: float = config_field("rope_base")
+    rope_max_t: int = config_field("rope_max_t")
+    rope_max_s: int = config_field("rope_max_s")
 
     # Optimizer config (like Tokenizer)
     lr: float = config_field("optim/lr")
@@ -912,6 +832,14 @@ class Dynamics(nn.Module):
         self.agent_slice = sl.get(Modality.AGENT, slice(0, 0))
         modality_ids = self.layout.modality_ids()
 
+        attn_conf = {
+            "attention_type": self.attention_type,
+            "n_kv_heads": self.n_kv_heads,
+            "rope_base": self.rope_base,
+            "rope_max_t": self.rope_max_t,
+            "rope_max_s": self.rope_max_s,
+        }
+
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -923,6 +851,7 @@ class Dynamics(nn.Module):
             mlp_ratio=self.mlp_ratio,
             time_every=self.time_every,
             latents_only_time=False,
+            attn_conf=attn_conf,
         )
 
         self.flow_x_head = nn.Linear(self.d_model, self.d_spatial)
@@ -1023,29 +952,29 @@ class Dynamics(nn.Module):
 
     def forward(
         self,
-        actions: Optional[torch.Tensor],          # (B,T,16) or None
-        step_idxs: torch.Tensor,                  # (B,T)
-        signal_idxs: torch.Tensor,                # (B,T)
-        packed_enc_tokens: torch.Tensor,          # (B,T,n_spatial,d_spatial)
+        actions: Optional[torch.Tensor],
+        step_idxs: torch.Tensor,
+        signal_idxs: torch.Tensor,
+        packed_enc_tokens: torch.Tensor,
         *,
-        act_mask: Optional[torch.Tensor] = None,  # (B,T,16) or (16,) or None
+        act_mask: Optional[torch.Tensor] = None,
         agent_tokens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T = packed_enc_tokens.shape[:2]
 
-        spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B,T,n_spatial,d_model)
+        spatial_tokens = self.spatial_proj(packed_enc_tokens)
 
         action_tokens = self.action_encoder(
             actions,
             batch_time_shape=(B, T),
             act_mask=act_mask,
             as_tokens=True,
-        )  # (B,T,1,d_model)
+        )
 
-        reg = self.register_tokens.view(1, 1, self.n_register, self.d_model).expand(B, T, -1, -1)
+        reg = repeat(self.register_tokens, 'r d -> b t r d', b=B, t=T)
 
-        step_tok = self.step_embed(step_idxs.to(torch.long))[:, :, None, :]
-        sig_tok = self.signal_embed(signal_idxs.to(torch.long))[:, :, None, :]
+        step_tok = rearrange(self.step_embed(step_idxs), 'b t d -> b t 1 d')
+        sig_tok = rearrange(self.signal_embed(signal_idxs), 'b t d -> b t 1 d')
 
         if self.n_agent > 0:
             if agent_tokens is None:
@@ -1054,16 +983,15 @@ class Dynamics(nn.Module):
         else:
             toks = [action_tokens, sig_tok, step_tok, spatial_tokens, reg]
 
-        tokens = torch.cat(toks, dim=2)  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
+        tokens = torch.cat(toks, dim=2)
         x = self.transformer(tokens)
 
         spatial_out = x[:, :, self.spatial_slice, :]
-        x1_hat = self.flow_x_head(spatial_out)  # (B,T,n_spatial,d_spatial)
+        x1_hat = self.flow_x_head(spatial_out)
 
         h_t = None
         if self.n_agent > 0:
-            h_t = x[:, :, self.agent_slice, :]   # (B,T,n_agent,d_model)
+            h_t = x[:, :, self.agent_slice, :]
 
         return x1_hat, h_t
 
@@ -1215,9 +1143,8 @@ def lpips_on_mae_recon(
     recon = (recon.clamp(0, 1) * 2.0 - 1.0)
     tgt   = (tgt.clamp(0, 1)   * 2.0 - 1.0)
 
-    B, T = recon.shape[:2]
-    recon = recon.reshape(B * T, C, H, W)
-    tgt   = tgt.reshape(B * T, C, H, W)
+    recon = rearrange(recon, 'b t c h w -> (b t) c h w')
+    tgt   = rearrange(tgt,   'b t c h w -> (b t) c h w')
     
     lp = lpips_fn(recon, tgt)
 

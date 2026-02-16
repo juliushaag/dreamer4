@@ -4,24 +4,37 @@ patch_size: 8
 
 latent_dim: 384
 compile: True 
-num_heads: 8
-num_layers: 12
+num_layers: 16
 num_latents: 32
 bottleneck_dim: 32
 dropout: 0.05
-mlp_ratio: 2.67
-time_embedding_every: 4
+mlp_ratio: 4.0
 mae_prob_min: 0.0
 mae_prob_max: 0.9
+time_embedding_every: 4
 latents_only_time: true
-
 gradient_checkpointing: false  # Enable to save memory
+parallel_alpha: 1.0
+parallel_beta: 1.0
+
+# Attention configuration
+attention:
+  type: "GQA"  # "mha" or "gqa"
+  heads: 16
+  kv_heads: 4  # Number of KV heads for GQA (must divide num_heads)
+  head_dim : 16
+  dropout: 0.05
+  qk_norm: true  # Use QK normalization
+  rope_base: 10000.0  # RoPE base frequency
+  rope_max_t: 1024  # Max temporal positions
+  rope_max_s: 1024  # Max spatial positions
+  bias: false
 
 optim:
   lr: 0.0003  
   weight_decay: 0.01
-  max_steps: 2000
-  grad_accum: 2  
+  max_steps: 2000000
+  grad_accum: 2
   warmup_steps: 2000
   min_lr: 1.0e-6
 
@@ -31,7 +44,7 @@ lpips:
   net: "alex"
 
 dataloader:
-  batch_size: 8  
+  batch_size: 8
   num_workers: 8
   pin_memory: true
   drop_last: true
@@ -44,7 +57,7 @@ wandb:
   entity: null
 
 training:
-  maxsteps: 1000000
+  maxsteps: 2000000
   log_every: 100
   print_every: 100
   viz_every: 500

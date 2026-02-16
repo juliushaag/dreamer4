@@ -11,6 +11,14 @@ n_register: 4
 n_agent: 1
 space_mode: wm_agent_isolated
 
+# Attention configuration
+attention_type: "gqa"  # "mha" or "gqa"
+n_kv_heads: 1  # Number of KV heads for GQA (must divide n_heads)
+qk_norm: true  # Use QK normalization
+rope_base: 10000.0  # RoPE base frequency
+rope_max_t: 1024  # Max temporal positions
+rope_max_s: 1024  # Max spatial positions
+
 # Shortcut / schedule
 k_max: 8
 bootstrap_start: 5000
