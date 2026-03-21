@@ -2,32 +2,33 @@ checkpoint_dir: ./logs/tokenizer_ckpts
 
 patch_size: 8
 
-latent_dim: 384
+latent_dim: 512
 compile: True 
-num_layers: 16
+num_layers: 12
 num_latents: 32
 bottleneck_dim: 32
 dropout: 0.05
-mlp_ratio: 4.0
+mlp_ratio: 6.00
 mae_prob_min: 0.0
 mae_prob_max: 0.9
 time_embedding_every: 4
 latents_only_time: true
-gradient_checkpointing: false  # Enable to save memory
+gradient_checkpointing: true  # Enable to save memory
+
 parallel_alpha: 1.0
 parallel_beta: 1.0
 
 # Attention configuration
 attention:
-  type: "GQA"  # "mha" or "gqa"
-  heads: 16
-  kv_heads: 4  # Number of KV heads for GQA (must divide num_heads)
+  type: "GQA"  # "MHA" or "GQA"
+  heads: 24
+  kv_heads: 8  # Number of KV heads for GQA (must divide num_heads)
   head_dim : 16
   dropout: 0.05
   qk_norm: true  # Use QK normalization
   rope_base: 10000.0  # RoPE base frequency
-  rope_max_t: 1024  # Max temporal positions
-  rope_max_s: 1024  # Max spatial positions
+  rope_max_t: 16  # Max temporal positions
+  rope_max_s: 512  # Max spatial positions
   bias: false
 
 optim:
@@ -44,12 +45,12 @@ lpips:
   net: "alex"
 
 dataloader:
-  batch_size: 8
+  batch_size: 32
   num_workers: 8
   pin_memory: true
   drop_last: true
   persistent_workers: true
-  prefetch_factor: 20
+  prefetch_factor: 4
 
 wandb:
   mode: "online"

@@ -1,0 +1,30 @@
+# Generalized trainer configuration
+# This config is used by the new modular trainer system
+
+# Training loop
+max_steps: 1000000
+grad_accum: 2
+grad_clip: 1.0
+
+# Mixed precision
+mixed_precision: true
+mixed_precision_dtype: "bfloat16"  # "bfloat16" or "float16"
+
+# Logging
+log_every: 100
+print_every: 100
+
+# Validation
+val_every: 1000
+val_max_batches: 50
+
+# Checkpointing
+save_every: 5000
+ckpt_dir: "./logs/trainer_ckpts"
+keep_last_n: 3
+save_best: true
+auto_resume: true
+
+# Visualization
+viz_every: 500
+viz_max_items: 4

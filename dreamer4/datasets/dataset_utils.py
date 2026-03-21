@@ -14,60 +14,6 @@ import torch
 from torch.utils.data import Dataset
 
 
-class DemoCache:
-    """LRU cache for demo/shard data with memory limit.
-    
-    Supports caching both dict of tensors and single tensors.
-    """
-    
-    def __init__(self, max_bytes: int = 2 * 1024 * 1024 * 1024):  # 2GB default
-        self._cache: OrderedDict[Any, Union[Dict[str, torch.Tensor], torch.Tensor]] = OrderedDict()
-        self._nbytes = 0
-        self._max_bytes = max_bytes
-    
-    def _compute_nbytes(self, data: Union[Dict[str, torch.Tensor], torch.Tensor]) -> int:
-        """Compute the byte size of cached data."""
-        if isinstance(data, dict):
-            return sum(t.nbytes for t in data.values() if hasattr(t, 'nbytes'))
-        elif hasattr(data, 'nbytes'):
-            return data.nbytes
-        return 0
-    
-    def get(self, key: Any) -> Optional[Union[Dict[str, torch.Tensor], torch.Tensor]]:
-        """Get item from cache, moving it to end (most recently used)."""
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
-        return None
-    
-    def put(self, key: Any, data: Union[Dict[str, torch.Tensor], torch.Tensor]):
-        """Put item in cache, evicting old entries if needed."""
-        nbytes = self._compute_nbytes(data)
-        
-        # Evict old entries if needed
-        while self._nbytes + nbytes > self._max_bytes and len(self._cache) > 0:
-            _, old_data = self._cache.popitem(last=False)
-            self._nbytes -= self._compute_nbytes(old_data)
-        
-        self._cache[key] = data
-        self._nbytes += nbytes
-    
-    def clear(self):
-        """Clear all cached data."""
-        self._cache.clear()
-        self._nbytes = 0
-    
-    @property
-    def size_bytes(self) -> int:
-        """Current cache size in bytes."""
-        return self._nbytes
-    
-    @property
-    def size_mb(self) -> float:
-        """Current cache size in MB."""
-        return self._nbytes / (1024 * 1024)
-
-
 class TrajectorySubset(Dataset):
     """
     A subset of a dataset that only includes specific indices.

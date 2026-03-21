@@ -164,12 +164,11 @@ def train(args):
     
     
     # Split by trajectory (respects episode boundaries)
-    try:
-        val_fraction = conf.get("data/val_fraction", float)
-    except KeyError:
-        val_fraction = 0.1
+    val_fraction = conf.get(f"{ds_name}_data/val_fraction", float)
+   
     
     # Use appropriate split function based on dataset type
+    print(ds_name)
     if ds_name == "robocasa":
         train_dataset, val_dataset = robocasa_split(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
     else:
@@ -262,18 +261,10 @@ def train(args):
     viz_max_T = conf.get("tokenizer/training/viz_max_T")
     
     # Validation config with defaults
-    try:
-        val_every = conf.get("tokenizer/training/val_every", int)
-    except KeyError:
-        val_every = 1000
-    try:
-        val_max_batches = conf.get("tokenizer/training/val_max_batches", int)
-    except KeyError:
-        val_max_batches = 50
-    try:
-        val_lpips_frac = conf.get("tokenizer/training/val_lpips_frac", float)
-    except KeyError:
-        val_lpips_frac = 0.25
+    val_every = conf.get("tokenizer/training/val_every", int)
+
+    val_max_batches = conf.get("tokenizer/training/val_max_batches", int)
+    val_lpips_frac = conf.get("tokenizer/training/val_lpips_frac", float)
         
     grad_accum = conf.get("tokenizer/optim/grad_accum")
     
@@ -290,7 +281,7 @@ def train(args):
                 
                 # Gradient accumulation: only step optimizer every grad_accum batches
                 accumulate = (accum_step + 1) % grad_accum != 0
-                loss, mse, lp, keep_prob, mae_mask = model_module.train_step(x, accumulate=accumulate)
+                loss, mse, lp, keep_prob, mae_mask = model.train_step(x, accumulate=accumulate)
                 accum_step += 1
                 
                 # Only count as a "step" when we actually update weights

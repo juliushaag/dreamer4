@@ -85,8 +85,6 @@ class GroupedQueryAttention(nn.Module):
 
     def __init__(self, d_model : int):
         super().__init__()
-        assert d_model % self.n_heads == 0
-
         self.n_groups = self.n_heads // self.n_kv_heads
         self.dropout_p = self.dropout
 
@@ -99,12 +97,6 @@ class GroupedQueryAttention(nn.Module):
 
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
-
-    def _repeat_kv(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.n_groups == 1:
-            return k, v
-        return repeat(k, "b g l d -> b (g h) l d", h=self.n_groups), \
-               repeat(v, "b g l d -> b (g h) l d", h=self.n_groups)
 
     def _get_positions(self, L: int, device: torch.device):
         T, S = self.rope_max_t, self.rope_max_s
@@ -125,9 +117,8 @@ class GroupedQueryAttention(nn.Module):
         q = rearrange(self.q_proj(x), "b l (h d) -> b h l d", h=self.n_heads)
         k = rearrange(self.k_proj(x), "b l (g d) -> b g l d", g=self.n_kv_heads)
         v = rearrange(self.v_proj(x), "b l (g d) -> b g l d", g=self.n_kv_heads)
-        q, k = self.q_norm(q), self.k_norm(k)
-        k, v = self._repeat_kv(k, v)
 
+        q, k = self.q_norm(q), self.k_norm(k)
 
         t_pos, s_pos = self._get_positions(L, device)
         q, k = self.rope(q, k, t_pos, s_pos)

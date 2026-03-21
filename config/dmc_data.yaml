@@ -3,7 +3,7 @@ image_width: 128
 image_channels: 3
 
 strict_tasks: true
-sequence_length: 16
+sequence_length: 8
 
 # Train/val split fraction (respects trajectory boundaries)
 val_fraction: 0.1

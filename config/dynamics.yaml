@@ -1,23 +1,32 @@
 # Dynamics model config
-d_model: 512
+latent_dim: 512
 n_heads: 4
-depth: 8
+num_layers: 8
 dropout: 0.0
 mlp_ratio: 4.0
-time_every: 1
+time_embedding_every: 1
 
 packing_factor: 2
 n_register: 4
 n_agent: 1
 space_mode: wm_agent_isolated
 
+parallel_alpha: 1.0
+parallel_beta: 1.0
+
 # Attention configuration
-attention_type: "gqa"  # "mha" or "gqa"
-n_kv_heads: 1  # Number of KV heads for GQA (must divide n_heads)
-qk_norm: true  # Use QK normalization
-rope_base: 10000.0  # RoPE base frequency
-rope_max_t: 1024  # Max temporal positions
-rope_max_s: 1024  # Max spatial positions
+attention:
+  type: "GQA"  # "MHA" or "GQA"
+  heads: 24
+  kv_heads: 8  # Number of KV heads for GQA (must divide num_heads)
+  head_dim : 16
+  dropout: 0.05
+  qk_norm: true  # Use QK normalization
+  rope_base: 10000.0  # RoPE base frequency
+  rope_max_t: 16  # Max temporal positions
+  rope_max_s: 512  # Max spatial positions
+  bias: false
+
 
 # Shortcut / schedule
 k_max: 8

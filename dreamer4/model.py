@@ -247,8 +247,13 @@ class TimeSelfAttention(nn.Module):
         elif self.attention_type == "GQA":
             self.attn = GroupedQueryAttention(self.d_model, **self._config.select("attention"))
 
-        self.forward = self.forward_latents_only if self.latents_only else self.forward_latents_all
-
+        
+    def forward(self, x: torch.Tensor):
+        if self.latents_only:
+            return self.forward_latents_only(x)
+        else:
+            return self.forward_latents_all(x)
+        
     def forward_latents_all(self, x_btSd: torch.Tensor):
         B, T, S, D = x_btSd.shape
         x_bst = rearrange(x_btSd, 'b t s d -> (b s) t d')
@@ -262,42 +267,6 @@ class TimeSelfAttention(nn.Module):
         out = self.attn(lat, is_causal=True)
         out = rearrange(out, '(b l) t d -> b t l d', b=B, l=L)
         return torch.cat([out, x_btSd[:, :, L:, :]], dim=2)
-
-@configclass
-class BlockCausalLayer(nn.Module):
-    d_model: int = config_field("latent_dim")
-    time_every: float = config_field("time_embedding_every")
-    mlp_ratio: float = config_field("mlp_ratio")
-    dropout: float = config_field("dropout")
-    
-    def __init__(self, layer_index : int, modality_ids: torch.Tensor, space_mode: str):
-        super().__init__()
-        self.do_time = ((layer_index + 1) % self.time_every == 0)
-
-        self.res1 = nn.Sequential(
-            nn.RMSNorm(self.d_model),
-            SpaceSelfAttentionModality(modality_ids, space_mode, **self._config.select()),
-            nn.Dropout(self.dropout, True)
-        )
-
-        self.res2 = nn.Identity() if not self.do_time else nn.Sequential(
-            nn.RMSNorm(self.d_model),
-            TimeSelfAttention(**self._config.select()),
-            nn.Dropout(self.dropout, True),
-        )
-        
-        self.res3 = nn.Sequential(
-            nn.RMSNorm(self.d_model),
-            MLP(self.d_model, mlp_ratio=self.mlp_ratio, dropout=self.dropout),
-            nn.Dropout(self.dropout, True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.res1(x)
-        if self.do_time: 
-            x = x + self.res2(x)
-        x = x + self.res3(x)
-        return x
 
 
 @configclass
@@ -337,8 +306,9 @@ class ParallelBlockCausalLayer(nn.Module):
         x_norm = self.norm(x)
         
         attn_out = self.space_attn(x_norm)
-        if self.do_time:
-            attn_out = attn_out + self.time_attn(x_norm)
+        
+        time = self.time_attn(x_norm) if self.do_time else 0
+        attn_out = attn_out + time
             
         mlp_out = self.mlp(x_norm)
         
@@ -348,7 +318,7 @@ class ParallelBlockCausalLayer(nn.Module):
 
 @configclass
 class BlockCausalTransformer(nn.Module):
-    gradient_checkpointing : bool = config_field("gradient_checkpointing")
+    gradient_checkpointing : bool = True
     depth : int = config_field("num_layers")
 
     def __init__(
@@ -642,13 +612,18 @@ class Tokenizer(nn.Module):
         return loss, mse, lp, keep_prob, mae_mask
 
 def pack_bottleneck_to_spatial(z_btLd: torch.Tensor, *, n_spatial: int, k: int) -> torch.Tensor:
-    B, T, L, D = z_btLd.shape
+    """
+    Pack encoded states Batch x Temporal x N_Latents x D_bottelneck to Batch x Temporal x N_Spatial x D_Spatial.
+    Basically we tokenized a temporal set of images into N_Latents of D_bottelneck latents
+    for the sake of performance we pack 2 or more (k) into one token for our dynamics model.
+    """
     return rearrange(z_btLd, 'b t (n k) d -> b t n (k d)', n=n_spatial, k=k)
 
 
 def unpack_spatial_to_bottleneck(z_btSd: torch.Tensor, *, k: int) -> torch.Tensor:
-    B, T, S, DK = z_btSd.shape
-    D = DK // k
+    """
+    Look at pack_bottleneck_to_spatial its just the reverse.
+    """
     return rearrange(z_btSd, 'b t n (k d) -> b t (n k) d', k=k)
 
 
@@ -751,23 +726,15 @@ def _sample_tau_for_step(device: torch.device, B: int, T: int, k_max: int, step_
 
 @configclass
 class Dynamics(nn.Module):
-    d_model: int = config_field("d_model")
-    n_heads: int = config_field("n_heads")
-    depth: int = config_field("depth")
+    d_model: int = config_field("latent_dim")
+    depth: int = config_field("num_layers")
     n_register: int = config_field("n_register")
     n_agent: int = config_field("n_agent")
     k_max: int = config_field("k_max")
     dropout: float = config_field("dropout")
     mlp_ratio: float = config_field("mlp_ratio")
-    time_every: int = config_field("time_every")
+    time_every: int = config_field("time_embedding_every")
     space_mode: str = config_field("space_mode")
-
-    # Attention config
-    attention_type: str = config_field("attention_type")
-    n_kv_heads: int = config_field("n_kv_heads")
-    rope_base: float = config_field("rope_base")
-    rope_max_t: int = config_field("rope_max_t")
-    rope_max_s: int = config_field("rope_max_s")
 
     # Optimizer config (like Tokenizer)
     lr: float = config_field("optim/lr")
@@ -793,12 +760,11 @@ class Dynamics(nn.Module):
         W = tokenizer.W
         C = tokenizer.C
 
-        patch = tokenizer.num_patches
+        patch = tokenizer.n_patches
         n_latents = tokenizer.decoder.n_latents
         d_bottleneck = tokenizer.decoder.d_bottleneck
 
 
-        assert H % patch == 0 and W % patch == 0
         assert n_latents % self.packing_factor == 0
         self.n_spatial = n_latents // self.packing_factor
         self.d_spatial = d_bottleneck * self.packing_factor
@@ -806,6 +772,8 @@ class Dynamics(nn.Module):
         assert self.d_spatial % d_bottleneck == 0
         
         self.spatial_proj = nn.Linear(self.d_spatial, self.d_model)
+
+        # ?What are these register tokens for
         self.register_tokens = nn.Parameter(torch.empty(self.n_register, self.d_model))
         nn.init.normal_(self.register_tokens, std=0.02)
 
@@ -815,6 +783,9 @@ class Dynamics(nn.Module):
         self.step_embed = nn.Embedding(self.num_step_bins, self.d_model)
         self.signal_embed = nn.Embedding(self.k_max + 1, self.d_model)
 
+        """
+        Okay so what are these segments and
+        """
         segments = [
             (Modality.ACTION, 1),
             (Modality.SHORTCUT_SIGNAL, 1),
@@ -832,26 +803,11 @@ class Dynamics(nn.Module):
         self.agent_slice = sl.get(Modality.AGENT, slice(0, 0))
         modality_ids = self.layout.modality_ids()
 
-        attn_conf = {
-            "attention_type": self.attention_type,
-            "n_kv_heads": self.n_kv_heads,
-            "rope_base": self.rope_base,
-            "rope_max_t": self.rope_max_t,
-            "rope_max_s": self.rope_max_s,
-        }
 
         self.transformer = BlockCausalTransformer(
-            d_model=self.d_model,
-            n_heads=self.n_heads,
-            depth=self.depth,
-            n_latents=0,
             modality_ids=modality_ids,
             space_mode=self.space_mode,
-            dropout=self.dropout,
-            mlp_ratio=self.mlp_ratio,
-            time_every=self.time_every,
-            latents_only_time=False,
-            attn_conf=attn_conf,
+            **self._config.select()
         )
 
         self.flow_x_head = nn.Linear(self.d_model, self.d_spatial)
@@ -890,14 +846,7 @@ class Dynamics(nn.Module):
         from miniconf import MiniConf
         conf = MiniConf(config)
         
-        # Handle both full project config (with "dynamics" key) and legacy dynamics-only config
-        if "dynamics" in config:
-            # Full project config - select dynamics subsection
-            dyn = cls(tokenizer=tokenizer, device=device, **conf.select("dynamics"))
-        else:
-            # Legacy: dynamics-only config (data embedded in dynamics config)
-            dyn = cls(tokenizer=tokenizer, device=device, **conf.select())
-        
+        dyn = cls(tokenizer=tokenizer, device=device, **conf.select("dynamics"))
         dyn.load_state_dict(ckpt["dynamics"], strict=True)
         
         # Move model to device BEFORE loading optimizer state

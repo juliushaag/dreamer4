@@ -24,40 +24,36 @@ from .dataset_utils import DemoCache, TrajectorySubset, collate_batch
 logger = logging.getLogger(__name__)
 
 
-@configclass
 class DMCDataset(Dataset):
     """Unified dataset for world model training with actions."""
-    
-    # Config fields - paths
-    data_dirs: List[str] = config_field("raw")           # paths to raw demo data (contains <task>.pt)
-    frames_dirs: List[str] = config_field("processed")   # paths to preprocessed frame shards
-    tasks: List[str] = config_field("tasks")
-    
-    # Config fields - dimensions  
-    seq_len: int = config_field("sequence_length")
-    img_size: int = config_field("image_height")
-    action_dim: int = 16
-    lang_dim: int = 512
-    
-    # Config fields - data loading
-    shard_size: int = 2048
-    cache_mb: int = 2048
-    strict_tasks: bool = config_field("strict_tasks")
-    tasks_json: str = config_field("task_json_file")
-
-    def __init__(self, verbose: bool = True):
+    def __init__(
+        self,
+        data_dirs: List[str],
+        frames_dirs: List[str],
+        tasks: List[str],
+        seq_len: int,
+        img_size: int,
+        strict_tasks: bool,
+        *,
+        action_dim: int = 16,
+        lang_dim: int = 512,
+        shard_size: int = 2048,
+        cache_mb: int = 2048,
+        verbose: bool = True,
+        **kwargs
+    ):
         super().__init__()
         
         self.verbose = verbose
-        self.H = self.img_size
-        self.W = self.img_size
-        self.A = self.action_dim
-        self.T = self.seq_len
-        self.cache_bytes = self.cache_mb * 1024 * 1024
+        self.H = img_size
+        self.W = img_size
+        self.A = action_dim
+        self.T = seq_len
+        self.cache_bytes = cache_mb * 1024 * 1024
         
         # Normalize and pair data_dirs with frames_dirs
-        data_dirs = [str(x) for x in self.data_dirs]
-        frames_dirs = [str(x) for x in self.frames_dirs]
+        data_dirs = [str(x) for x in data_dirs]
+        frames_dirs = [str(x) for x in frames_dirs]
         
         if len(data_dirs) != len(frames_dirs):
             if len(data_dirs) == 1:
@@ -72,17 +68,7 @@ class DMCDataset(Dataset):
         
         # Task metadata (action_dim + text_embedding)
         self.task_meta: Optional[dict] = None
-        if self.tasks_json and os.path.exists(self.tasks_json):
-            try:
-                with open(self.tasks_json, "r") as f:
-                    self.task_meta = json.load(f)
-            except Exception as e:
-                if self.verbose:
-                    print(f"[WMDataset] Warning: failed to load tasks_json={self.tasks_json}: {e}")
-        elif self.tasks_json and self.verbose:
-            print(f"[WMDataset] Warning: tasks_json not found at {self.tasks_json}")
-
-        self._zero_lang = torch.zeros(self.lang_dim, dtype=torch.float32)
+        self._zero_lang = torch.zeros(lang_dim, dtype=torch.float32)
         
         # LRU cache for shards
         self._cache = DemoCache(max_bytes=self.cache_bytes)
@@ -99,18 +85,9 @@ class DMCDataset(Dataset):
                     found_tasks.append(t)
         
         # Filter to requested tasks
-        tasks_filter = set(self.tasks) if self.tasks else None
+        tasks_filter = set(tasks).intersection(found_tasks)
         if tasks_filter is not None:
-            requested = [t for t in self.tasks if t in found_tasks]
-            if self.verbose:
-                missing = [t for t in tasks_filter if t not in set(found_tasks)]
-                print(f"[WMDataset] Task filter: keeping {len(requested)}/{len(found_tasks)} tasks")
-                if missing:
-                    msg = f"[WMDataset] WARNING: {len(missing)} requested tasks not found (e.g. {missing[:5]})"
-                    if self.strict_tasks:
-                        raise FileNotFoundError(msg)
-                    else:
-                        print(msg)
+            requested = [t for t in tasks if t in found_tasks]
             task_list = requested
         else:
             task_list = found_tasks
@@ -168,6 +145,7 @@ class DMCDataset(Dataset):
                 
                 if rew.ndim == 2 and rew.shape[-1] == 1:
                     rew = rew.squeeze(-1)
+                    
                 rew = rew.to(torch.float32)
                 
                 if act.ndim == 1:
@@ -327,9 +305,6 @@ class DMCDataset(Dataset):
 
     def _load_shard_frames(self, task_idx: int, seg_idx: int, shard_idx: int) -> torch.Tensor:
         key = (task_idx, seg_idx, shard_idx)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
 
         path = self.shard_lists[task_idx][seg_idx][shard_idx]
         td = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
@@ -351,7 +326,6 @@ class DMCDataset(Dataset):
         if frames.shape[-2] != self.H or frames.shape[-1] != self.W:
             raise RuntimeError(f"Shard frame size mismatch: {tuple(frames.shape[-2:])} != {(self.H, self.W)}")
 
-        self._cache.put(key, frames)
         return frames
 
     def _get_frames(self, task_idx: int, start: int, length: int) -> torch.Tensor:

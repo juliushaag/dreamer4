@@ -32,58 +32,36 @@ __all__ = ['RoboCasaDataset', 'collate_batch', 'TrajectorySubset', 'split_by_tra
 
 @configclass
 class RoboCasaDataset(Dataset):
-    """RoboCasa dataset for world model training with actions.
+    """RoboCasa dataset for world model training with actions."""
     
-    Uses HDF5's native chunked access with LRU caching of demo data
-    for efficient data loading.
-    """
-    
-    # Config fields - paths
-    data_root: str = config_field("data_root")  # e.g., /mnt/datasets/robocasa/v0.1
-    tasks: List[str] = config_field("tasks")     # list of task names or ["all"]
-    
-    # Config fields - dimensions
-    seq_len: int = config_field("sequence_length")
-    img_size: int = config_field("image_height")
-    action_dim: int = 12  # RoboCasa uses 12-dim actions (rel_pos, rel_rot_axis_angle, gripper)
-    lang_dim: int = 512
-    
-    # Config fields - data loading
-    cache_mb: int = 2048  # LRU cache size in MB
-    hdf5_key: str = "demo_gentex_im128_randcams.hdf5"  # or "demo_im128.hdf5" for multi-stage
-    image_key: str = "robot0_agentview_left_image"     # which camera to use
-    action_key: str = "actions"                        # "actions" for relative, "actions_abs" for absolute
-    
-    def __init__(self, verbose: bool = True):
+    def __init__(
+        self,
+        data_root: str,
+        tasks: List[str],
+        seq_len: int,
+        img_size: int,
+        action_dim: int = 12,
+        lang_dim: int = 512,
+        hdf5_key: str = "demo_gentex_im128_randcams.hdf5",
+        image_key: str = "robot0_agentview_left_image",
+        action_key: str = "actions",
+        verbose: bool = True
+    ):
         super().__init__()
         
+        self.image_key = image_key
+        self.action_key = action_key
         self.verbose = verbose
-        self.H = self.img_size
-        self.W = self.img_size
-        self.A = self.action_dim
-        self.T = self.seq_len
-        
-        # LRU cache for demo data
-        self._cache = DemoCache(max_bytes=self.cache_mb * 1024 * 1024)
-        
-        # Keep HDF5 file handles open
-        self._hdf5_handles: Dict[str, h5py.File] = {}
+        self.H = img_size
+        self.W = img_size
+        self.A = action_dim
+        self.T = seq_len
         
         # Discover tasks from data_root
         found_tasks = self._discover_tasks()
         
         # Filter to requested tasks
-        tasks_filter = set(self.tasks) if self.tasks and self.tasks != ["all"] else None
-        if tasks_filter is not None:
-            requested = [t for t in self.tasks if t in found_tasks]
-            if self.verbose:
-                missing = [t for t in tasks_filter if t not in set(found_tasks)]
-                print(f"[RoboCasaDataset] Task filter: keeping {len(requested)}/{len(found_tasks)} tasks")
-                if missing:
-                    print(f"[RoboCasaDataset] WARNING: {len(missing)} requested tasks not found (e.g. {missing[:5]})")
-            task_list = requested
-        else:
-            task_list = list(found_tasks.keys())
+        task_list = set(tasks).intersection(found_tasks) if tasks is not None else found_tasks
         
         # Storage
         self._tasks = []
@@ -95,7 +73,7 @@ class RoboCasaDataset(Dataset):
         
         # Per-task metadata
         self._lang_embs = []
-        self._zero_lang = torch.zeros(self.lang_dim, dtype=torch.float32)
+        self._zero_lang = torch.zeros(lang_dim, dtype=torch.float32)
         
         total = 0
         for task in task_list:
@@ -127,9 +105,9 @@ class RoboCasaDataset(Dataset):
                     actions = demo[self.action_key]
                     
                     # Check if image key exists
-                    if self.image_key not in demo['obs']:
+                    if image_key not in demo['obs']:
                         if self.verbose:
-                            logger.debug(f"Skipping {task}/{demo_key}: missing image key {self.image_key}")
+                            logger.debug(f"Skipping {task}/{demo_key}: missing image key {image_key}")
                         continue
                     
                     demo_len = actions.shape[0]
@@ -220,14 +198,13 @@ class RoboCasaDataset(Dataset):
     
     def _open_hdf5(self, path: str) -> h5py.File:
         """Open an HDF5 file with optimized settings for chunked access."""
-        if path not in self._hdf5_handles:
-            self._hdf5_handles[path] = h5py.File(
-                path, 'r',
-                libver='latest',
-                rdcc_nbytes=16 * 1024 * 1024,  # 16MB chunk cache
-                rdcc_nslots=10007,  # prime number for better hashing
-            )
-        return self._hdf5_handles[path]
+        
+        return h5py.File(
+            path, 'r',
+            libver='latest',
+            rdcc_nbytes=16 * 1024 * 1024,  # 16MB chunk cache
+            rdcc_nslots=10007,  # prime number for better hashing
+        )
     
     def __len__(self):
         return self._cum_counts[-1]
@@ -248,14 +225,7 @@ class RoboCasaDataset(Dataset):
         return task_idx, demo_idx, start
     
     def _load_demo(self, task_idx: int, demo_idx: int) -> Dict[str, torch.Tensor]:
-        """Load entire demo data, using cache when available."""
-        cache_key = (task_idx, demo_idx)
-        
-        # Check cache first
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
-        
+        """Load entire demo data, using cache when available."""    
         # Load from HDF5
         hdf5_path = self._hdf5_paths[task_idx]
         demo_key = self._demo_keys[task_idx][demo_idx]
@@ -290,9 +260,6 @@ class RoboCasaDataset(Dataset):
             'actions': actions,
             'rewards': rewards,
         }
-        
-        # Cache the demo
-        self._cache.put(cache_key, data)
         
         return data
     
@@ -334,7 +301,6 @@ class RoboCasaDataset(Dataset):
             except:
                 pass
         self._hdf5_handles.clear()
-        self._cache.clear()
     
     def __del__(self):
         self.close()

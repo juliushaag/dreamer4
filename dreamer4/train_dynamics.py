@@ -16,8 +16,8 @@ import einops
 import wandb
 
 from miniconf import MiniConf
-from datasets.robocasa_dataset import RoboCasaDataset
-from datasets.wm_dataset import DMCDataset , collate_batch, split_by_trajectory
+from datasets.robocasa_dataset import RoboCasaDataset, split_by_trajectory as robocasa_split
+from datasets.wm_dataset import DMCDataset, collate_batch, split_by_trajectory as dmc_split
 from model import (
     Tokenizer,
     Dynamics,
@@ -471,7 +471,7 @@ def train(args):
     # ---- data ----
     
     # ---- data ----
-    ds_name = conf.select("dataset") 
+    ds_name = conf.get("dataset") 
     if ds_name == "robocasa":
         dataset = RoboCasaDataset(**conf.select("robocasa_data"))
     elif ds_name == "dmc":
@@ -484,7 +484,11 @@ def train(args):
         val_fraction = conf.get("data/val_fraction", float)
     except KeyError:
         val_fraction = 0.1
-    train_dataset, val_dataset = split_by_trajectory(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
+
+    if ds_name == "robocasa":
+        train_dataset, val_dataset = robocasa_split(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
+    else:
+        train_dataset, val_dataset = dmc_split(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
     
     if is_rank0():
         print(f"[Data] Train: {len(train_dataset):,} sequences, Val: {len(val_dataset):,} sequences")
@@ -509,13 +513,13 @@ def train(args):
     )
 
     # ---- tokenizer (frozen) ----
-    tokenizer_ckpt = conf.get("tokenizer/checkpoint_dir", str) + "/latest.pt"
+    tokenizer_ckpt = "logs/tokenizer_long_run/best.pt"
     tokenizer = load_frozen_tokenizer(tokenizer_ckpt, device=device)
 
     H = tokenizer.H
     W = tokenizer.W
     C = tokenizer.C
-    patch = tokenizer.num_patches
+    patch = tokenizer.n_patches
     packing_factor = conf.get("dynamics/packing_factor", int)
 
     # ---- model ----
@@ -612,7 +616,7 @@ def train(args):
 
                 # ---- train step ----
                 accumulate = (accum_step + 1) % grad_accum != 0
-                aux = model_module.train_step(
+                aux = model.train_step(
                     frames=frames,
                     actions=actions,
                     act_mask=act_mask,
