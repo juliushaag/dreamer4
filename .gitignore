@@ -1,6 +1,7 @@
 # VSCode settings
 .vscode/
-
+.venv/
+design/
 # Wandb
 wandb/
 logs/
