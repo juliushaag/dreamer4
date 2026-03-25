@@ -1,4 +1,5 @@
 # train_dynamics.py
+from collections import defaultdict
 import os
 import time
 import math
@@ -15,12 +16,16 @@ import einops
 
 import wandb
 
+from dreamer4.datasets.dataset_utils import load_datasets
 from miniconf import MiniConf
 from datasets.robocasa_dataset import RoboCasaDataset, split_by_trajectory as robocasa_split
-from datasets.wm_dataset import DMCDataset, collate_batch, split_by_trajectory as dmc_split
+from dreamer4.datasets.dmc_dataset import DMCDataset, collate_batch, split_by_trajectory as dmc_split
 from model import (
     Tokenizer,
     Dynamics,
+    _emax_from_kmax,
+    _sample_step_excluding_dmin,
+    _sample_tau_for_step,
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial,
     unpack_spatial_to_bottleneck,
@@ -30,54 +35,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(True)
 
-
-def is_torchrun() -> bool:
-    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
-
-
-def get_dist_info():
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    return rank, world_size, local_rank
-
-
-def is_rank0() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
-
-
-def seed_everything(seed: int):
-    s = int(seed) % (2**32)
-    random.seed(s)
-    np.random.seed(s)
-    torch.manual_seed(s)
-    torch.cuda.manual_seed_all(s)
-
-
-def worker_init_fn(worker_id: int):
-    info = torch.utils.data.get_worker_info()
-    seed_everything(info.seed)
-
-
-def init_distributed() -> tuple[bool, int, int, int]:
-    rank, world_size, local_rank = get_dist_info()
-    ddp = world_size > 1
-    if ddp:
-        dist.init_process_group(backend="nccl", init_method="env://")
-        torch.cuda.set_device(local_rank)
-    return ddp, rank, world_size, local_rank
-
-
-@torch.no_grad()
-def load_frozen_tokenizer(ckpt_path: str, device: torch.device) -> Tokenizer:
-    """Load a frozen tokenizer from checkpoint."""
-    tok, _ = Tokenizer.from_checkpoint(Path(ckpt_path))
-    tok = tok.to(device)
-    tok.eval()
-    for p in tok.parameters():
-        p.requires_grad_(False)
-    return tok
-
+from dreamer4.train_utils import TrainingState, create_cosine_scheduler, init_distributed, is_rank0, num_model_params, seed_everything, worker_init_fn
 
 # ---- Evaluation helpers ----
 
@@ -338,7 +296,6 @@ def run_eval(
 
 @torch.no_grad()
 def run_validation_dynamics(
-    *,
     dyn: Dynamics,
     tokenizer: Tokenizer,
     val_loader: DataLoader,
@@ -467,86 +424,104 @@ def train(args):
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     seed_everything(conf.get("seed", int) + rank)
-
-    # ---- data ----
-    
-    # ---- data ----
-    ds_name = conf.get("dataset") 
-    if ds_name == "robocasa":
-        dataset = RoboCasaDataset(**conf.select("robocasa_data"))
-    elif ds_name == "dmc":
-        dataset = DMCDataset(**conf.select("dmc_data"))
-    else:
-        raise ValueError(f"Invalid dataset specified {ds_name}")
-    
-    # Split by trajectory (respects episode boundaries) - same as tokenizer
-    try:
-        val_fraction = conf.get("data/val_fraction", float)
-    except KeyError:
-        val_fraction = 0.1
-
-    if ds_name == "robocasa":
-        train_dataset, val_dataset = robocasa_split(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
-    else:
-        train_dataset, val_dataset = dmc_split(dataset, val_fraction=val_fraction, seed=conf.get("seed", int))
     
     if is_rank0():
         print(f"[Data] Train: {len(train_dataset):,} sequences, Val: {len(val_dataset):,} sequences")
 
-    sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
-
-    loader = DataLoader(
-        train_dataset,
-        sampler=sampler,
-        worker_init_fn=worker_init_fn,
-        shuffle=(sampler is None),
-        collate_fn=collate_batch,
-        **conf.get("dynamics/dataloader")
-    )
+    train_dataset, val_dataset = load_datasets(conf.get("dataset"))
     
-    # Validation loader
+    if is_rank0():
+        print(f"[Data] Train: {len(train_dataset):,} sequences, Val: {len(val_dataset):,} sequences")
+
+    if ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False
+        )
+
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    else:
+        train_sampler=None
+        val_sampler = None
+
+    train_loader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        worker_init_fn=worker_init_fn,
+        shuffle=(train_sampler is None),
+        collate_fn=collate_batch,
+        **conf.get("tokenizer/dataloader")
+    )
+
     val_loader = DataLoader(
         val_dataset,
+        sampler=val_sampler,
         shuffle=False,
         collate_fn=collate_batch,
-        **conf.get("dynamics/dataloader")
-    )
+        **conf.get("tokenizer/dataloader")
+    )   
 
     # ---- tokenizer (frozen) ----
-    tokenizer_ckpt = "logs/tokenizer_long_run/best.pt"
-    tokenizer = load_frozen_tokenizer(tokenizer_ckpt, device=device)
+    H = conf.get(f"dataset/image_height", int)
+    W = conf.get(f"dataset/image_width", int)
+    C = 3  # RGB
+    P = conf.get("tokenizer/patch_size", int)
+    
+    assert H % P == 0 and W % P == 0
+   
+    tokenizer_state = TrainingState(
+        model=Tokenizer(C, H, W)
+    ) 
 
-    H = tokenizer.H
-    W = tokenizer.W
-    C = tokenizer.C
+    tokenizer_ckpt = "logs/tokenizer_long_run/best.pt"
+    tokenizer_state.load(tokenizer_ckpt)
+
+    tokenizer : Tokenizer = tokenizer_state.model
     patch = tokenizer.n_patches
+
+    if is_rank0():
+        print(f"Loaded tokenizer checkpoint {tokenizer_ckpt}: steps={tokenizer_state.steps}, best_val={tokenizer_state.best_val}")
+
     packing_factor = conf.get("dynamics/packing_factor", int)
 
     # ---- model ----
     ckpt_dir = Path(conf.get("dynamics/training/ckpt_dir", str))
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Initialize model (or resume from checkpoint)
-    step = 0
-    start_epoch = 0
-    best_val_loss = float('inf')
     
-    if args.resume:
-        if is_rank0():
-            print(f"[Resume] Loading checkpoint from {args.resume}")
-        model, ckpt_info = Dynamics.from_checkpoint(Path(args.resume), tokenizer=tokenizer, device=str(device))
-        model = model.to(device)
-        step = ckpt_info["step"]
-        start_epoch = ckpt_info["epoch"]
-        best_val_loss = ckpt_info.get("best_val_loss", float('inf'))
-        if is_rank0():
-            print(f"[Resume] Resumed from step {step}, epoch {start_epoch}, best_val_loss={best_val_loss:.6f}")
-    else:
-        model = Dynamics(tokenizer=tokenizer, device=str(device), **conf.select("dynamics")).to(device)
+    state = TrainingState(
+        Dynamics(tokenizer=tokenizer, device=device)
+    )
 
+     # Create optimizer (like Tokenizer)
+    state.opt = torch.optim.AdamW(
+        state.model.parameters(),
+        fused=torch.cuda.is_available(),
+        **conf.get("dynamics/optim")
+    )
+
+    # Learning rate scheduler with warmup + cosine decay
+    state.scheduler = create_cosine_scheduler(
+        optimizer=state.opt,
+        **conf.get("dynamics/opt_sched"),
+        max_steps=conf.get("dynamics/training/maxsteps"),
+        base_lr=conf.get("dynamics/optim/lr"),
+    )
+
+    if conf.get("compile", bool):
+        state.model.forward = torch.compile(state.model.forward)
+
+
+    if args.resume:
+        
+        state.load(args.resume)
+
+        if is_rank0():
+            print(f"[Resume] Resumed from step {state.steps}, best_val_loss={state.best_val:.6f}")
+  
     if is_rank0():
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Learnable parameters: {param_count:,}")
+        params = num_model_params(state.model)
+        print(f"Learnable parameters: {params["trainable"]}, all: {params["all"]}")
 
     if ddp:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -555,12 +530,17 @@ def train(args):
 
     # ---- wandb ----
     if is_rank0():
-        wandb.init(
+        ckpt_dir = Path(conf.get("dynamics/training/ckpt_dir", str))
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        run = wandb.init(
             **conf.get("dynamics/wandb"),
             config=conf.asdict(),
+            id=state.wandb_run,
             resume="allow" if args.resume else None,
         )
-
+        state.wandb_run = run.id
+    
     # ---- train ----
     model.train()
     t0 = time.monotonic()
@@ -574,27 +554,31 @@ def train(args):
     use_actions = conf.get("dynamics/use_actions", bool)
     
     # Validation config with defaults
-    try:
-        val_every = conf.get("dynamics/training/val_every", int)
-    except KeyError:
-        val_every = 1000
-    try:
-        val_max_batches = conf.get("dynamics/training/val_max_batches", int)
-    except KeyError:
-        val_max_batches = 25
-
-    accum_step = 0
+    val_every = conf.get("dynamics/training/val_every", int)
+ 
+    val_max_batches = conf.get("dynamics/training/val_max_batches", int)
+ 
     step_t0 = time.monotonic()
 
-    # Get the actual model (unwrap DDP if needed)
-    model_module = model.module if hasattr(model, "module") else model
 
-    while step < max_steps:
-        for epoch in range(start_epoch, 10_000_000):
-            if sampler is not None:
-                sampler.set_epoch(epoch)
+    packing_factor: int = conf.get("dynamics/packing_factor")
+    self_fraction: float = conf.get("dynamics/self_fraction")
+    bootstrap_start: int = conf.get("dynamics/bootstrap_start")
+   
+    
+    model.train()
+    start_step = state.steps
+    for state.steps in range(start_step, max_steps):
+        
+        step_t0 = time.monotonic()        
 
-            for batch in loader:
+        aux = defaultdict(default_factory=lambda: torch.zeros((grad_accum)))
+
+        model.train()
+        state.opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", torch.bfloat16):
+            for gs in range(grad_accum):
+                batch = next(train_loader)
                 # ---- prepare data ----
                 if use_actions and "act" in batch:
                     obs_u8 = batch["obs"].to(device, non_blocking=True)
@@ -615,117 +599,189 @@ def train(args):
                     act_mask = None
 
                 # ---- train step ----
-                accumulate = (accum_step + 1) % grad_accum != 0
-                aux = model.train_step(
-                    frames=frames,
-                    actions=actions,
-                    act_mask=act_mask,
-                    step=step,
-                    accumulate=accumulate,
+            with torch.no_grad():
+                patches = temporal_patchify(frames, tokenizer.n_patches)
+                z_btLd, _ = tokenizer.encoder(patches)
+                z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=model.n_spatial, k=model.packing_factor)
+
+            device = z1.device
+            B, T = z1.shape[:2]
+            B_self = int(round(self_fraction * B))
+            B_self = max(0, min(B - 1, B_self))
+            B_emp = B - B_self
+            emax = _emax_from_kmax(k_max)
+
+            # action mask slices
+            act_mask_full = act_mask
+            act_mask_self = None if act_mask_full is None else act_mask_full[B_emp:]
+
+            # step idx: empirical rows are finest (d_min), self rows sample coarser
+            step_idx_emp = torch.full((B_emp, T), emax, device=device, dtype=torch.long)
+            if B_self > 0:
+                d_self, step_idx_self = _sample_step_excluding_dmin(device, B_self, T, k_max)
+                step_idx_full = torch.cat([step_idx_emp, step_idx_self], dim=0)
+            else:
+                d_self = torch.zeros((0, T), device=device, dtype=torch.float32)
+                step_idx_self = torch.zeros((0, T), device=device, dtype=torch.long)
+                step_idx_full = step_idx_emp
+
+            # sigma/tau per row/time
+            sigma_full, sigma_idx_full = _sample_tau_for_step(device, B, T, k_max, step_idx_full)
+            sigma_emp = sigma_full[:B_emp]
+            sigma_self = sigma_full[B_emp:]
+            sigma_idx_self = sigma_idx_full[B_emp:]
+
+            # Corrupt inputs
+            z0_full = torch.randn_like(z1)
+            z_tilde_full = (1.0 - sigma_full)[..., None, None] * z0_full + sigma_full[..., None, None] * z1
+            z_tilde_self = z_tilde_full[B_emp:]
+
+            # Weights (0.9 * sigma + 0.1 gives higher weight to higher noise levels)
+            w_emp = 0.9 * sigma_emp + 0.1
+            w_self = 0.9 * sigma_self + 0.1
+
+            # Main forward
+            z1_hat_full, _ = model(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=None)
+            z1_hat_emp = z1_hat_full[:B_emp]
+            z1_hat_self = z1_hat_full[B_emp:]
+
+            flow_per = (z1_hat_emp.float() - z1[:B_emp].float()).pow(2).mean(dim=(2, 3))  # (B_emp,T)
+            loss_emp = (flow_per * w_emp).mean()
+
+            boot_mse = torch.zeros((), device=device, dtype=torch.float32)
+            loss_self = torch.zeros((), device=device, dtype=torch.float32)
+
+            do_boot = (B_self > 0) and (step >= bootstrap_start)
+            if do_boot:
+                d_half = d_self / 2.0
+                step_idx_half = step_idx_self + 1
+                sigma_plus = sigma_self + d_half
+                sigma_idx_plus = sigma_idx_self + (torch.tensor(k_max, device=device, dtype=torch.float32) * d_half).to(torch.long)
+
+                z1_hat_half1, _ = model(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_self, z_tilde_self, act_mask=act_mask_self, agent_tokens=None)
+                b_prime = (z1_hat_half1.float() - z_tilde_self.float()) / (1.0 - sigma_self).clamp_min(1e-6)[..., None, None]
+                z_prime = z_tilde_self.float() + b_prime * d_half[..., None, None]
+
+                z1_hat_half2, _ = model(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_plus, z_prime.to(z_tilde_self.dtype), act_mask=act_mask_self, agent_tokens=None)
+                b_doubleprime = (z1_hat_half2.float() - z_prime.float()) / (1.0 - sigma_plus).clamp_min(1e-6)[..., None, None]
+
+                vhat_sigma = (z1_hat_self.float() - z_tilde_self.float()) / (1.0 - sigma_self).clamp_min(1e-6)[..., None, None]
+                vbar_target = ((b_prime + b_doubleprime) / 2.0).detach()
+
+                boot_per = (1.0 - sigma_self).pow(2) * (vhat_sigma - vbar_target).pow(2).mean(dim=(2, 3))  # (B_self,T)
+                loss_self = (boot_per * w_self).mean()
+                boot_mse = boot_per.mean()
+
+    
+
+            # Combine losses
+            loss = (((loss_emp * (B - B_self)) + (loss_self * B_self)) / B) / grad_accum
+            loss.backward()
+
+            aux["loss_emp"][gs] = loss_emp.detach()
+            aux["loss_self"][gs] = loss_self.detach()
+            aux["bootstrap_mse"][gs] = boot_mse.detach()
+            aux["flow_mse"][gs] = flow_per.detach().mean()
+            aux["loss"][gs] = loss.mean()
+            aux["sigma_mean"][gs] = sigma_full.mean().mean()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        state.opt.step()
+        state.scheduler.step()               
+
+        for k in aux:
+            aux[k] = aux[k].mean()
+
+        step_time = time.monotonic() - step_t0
+        step_t0 = time.monotonic()
+
+        # ---- logging ----
+        if is_rank0() and (step % log_every == 0):
+            wandb.log({
+                "loss/total": float(aux["loss"].item()),
+                "loss/flow_mse": float(aux["flow_mse"].item()),
+                "loss/bootstrap_mse": float(aux["bootstrap_mse"].item()),
+                "loss/emp": float(aux["loss_emp"].item()),
+                "loss/self": float(aux["loss_self"].item()),
+                "stats/sigma_mean": float(aux["sigma_mean"].item()),
+                "lr": float(state.opt.param_groups[0]["lr"]),
+                "time/hrs": (time.monotonic() - t0) / 3600.0,
+                "time/step_ms": step_time * 1000.0,
+                "time/samples_per_sec": frames.shape[0] * grad_accum / step_time,
+            }, step=step)
+
+        if is_rank0() and (step % print_every == 0):
+            lr = state.opt.param_groups[0]["lr"]
+            print(
+                f"step {step:07d} | loss={aux["loss"].item():.6f} "
+                f"| flow_mse={aux['flow_mse'].item():.6f} | boot_mse={aux['bootstrap_mse'].item():.6f} "
+                f"| lr={lr:.2e} | {step_time*1000:.1f}ms/step"
+            )
+
+        # ---- validation ----
+        if is_rank0() and val_every > 0 and (step % val_every == 0):
+            torch.cuda.empty_cache()
+            
+            val_metrics = run_validation_dynamics(
+                dyn=model,
+                tokenizer=tokenizer,
+                val_loader=val_loader,
+                device=device,
+                packing_factor=packing_factor,
+                use_actions=use_actions,
+                step=step,
+                max_batches=val_max_batches,
+            )
+            
+            wandb.log(val_metrics, step=step)
+            print(
+                f"step {step:07d} | VAL flow_mse={val_metrics['val/flow_mse']:.6f}"
+            )
+            
+            # Best model checkpointing
+            if val_metrics['val/flow_mse'] < state.best_val:
+                state.best_val = val_metrics['val/flow_mse']
+                state.save(ckpt_dir / "best.pt")
+                print(f"  -> New best model saved (val_flow_mse={state.best_val:.6f})")
+            
+            torch.cuda.empty_cache()
+
+            # ---- eval (sampling) ----
+            if is_rank0() and eval_every > 0 and (step % eval_every == 0):
+                torch.cuda.empty_cache()
+
+                B_eval = min(frames.shape[0], conf.get("dynamics/eval/batch_size", int))
+                sched = make_tau_schedule(
+                    k_max=k_max,
+                    schedule=conf.get("dynamics/eval/schedule", str),
+                    d=conf.get("dynamics/eval/d", float)
                 )
-                loss = aux["loss"]
-                accum_step += 1
 
-                if not accumulate:
-                    step += 1
-                    # Step the scheduler
-                    model_module.scheduler.step()
-                else:
-                    continue
+                run_eval(
+                    tokenizer=tokenizer,
+                    dyn=model,
+                    frames=frames[:B_eval],
+                    actions=actions[:B_eval] if actions is not None else None,
+                    act_mask=None,
+                    H=H, W=W, C=C, patch=patch,
+                    packing_factor=packing_factor,
+                    k_max=k_max,
+                    ctx_length=conf.get("dynamics/eval/ctx", int),
+                    horizon=conf.get("dynamics/eval/horizon", int),
+                    sched=sched,
+                    max_items=conf.get("dynamics/eval/max_items", int),
+                    step=step,
+                )
 
-                step_time = time.monotonic() - step_t0
-                step_t0 = time.monotonic()
+                torch.cuda.empty_cache()
 
-                # ---- logging ----
-                if is_rank0() and (step % log_every == 0):
-                    wandb.log({
-                        "loss/total": float(loss.item()),
-                        "loss/flow_mse": float(aux["flow_mse"].item()),
-                        "loss/bootstrap_mse": float(aux["bootstrap_mse"].item()),
-                        "loss/emp": float(aux["loss_emp"].item()),
-                        "loss/self": float(aux["loss_self"].item()),
-                        "stats/sigma_mean": float(aux["sigma_mean"].item()),
-                        "lr": float(model_module.opt.param_groups[0]["lr"]),
-                        "time/hrs": (time.monotonic() - t0) / 3600.0,
-                        "time/step_ms": step_time * 1000.0,
-                        "time/samples_per_sec": frames.shape[0] * grad_accum / step_time,
-                    }, step=step)
+            # ---- ckpt ----
+            if is_rank0() and save_every > 0 and (step % save_every == 0):
+                ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
 
-                if is_rank0() and (step % print_every == 0):
-                    lr = model_module.opt.param_groups[0]["lr"]
-                    print(
-                        f"step {step:07d} | loss={loss.item():.6f} "
-                        f"| flow_mse={aux['flow_mse'].item():.6f} | boot_mse={aux['bootstrap_mse'].item():.6f} "
-                        f"| lr={lr:.2e} | {step_time*1000:.1f}ms/step"
-                    )
+                state.save(ckpt_path)
+                state.save(ckpt_dir / "latest.pt")
 
-                # ---- validation ----
-                if is_rank0() and val_every > 0 and (step % val_every == 0):
-                    torch.cuda.empty_cache()
-                    
-                    val_metrics = run_validation_dynamics(
-                        dyn=model_module,
-                        tokenizer=tokenizer,
-                        val_loader=val_loader,
-                        device=device,
-                        packing_factor=packing_factor,
-                        use_actions=use_actions,
-                        step=step,
-                        max_batches=val_max_batches,
-                    )
-                    
-                    wandb.log(val_metrics, step=step)
-                    print(
-                        f"step {step:07d} | VAL flow_mse={val_metrics['val/flow_mse']:.6f}"
-                    )
-                    
-                    # Best model checkpointing
-                    if val_metrics['val/flow_mse'] < best_val_loss:
-                        best_val_loss = val_metrics['val/flow_mse']
-                        model_module.save_checkpoint(ckpt_dir / "best.pt", step, epoch, best_val_loss, full_config=conf.asdict())
-                        print(f"  -> New best model saved (val_flow_mse={best_val_loss:.6f})")
-                    
-                    torch.cuda.empty_cache()
-
-                # ---- eval (sampling) ----
-                if is_rank0() and eval_every > 0 and (step % eval_every == 0):
-                    torch.cuda.empty_cache()
-
-                    B_eval = min(frames.shape[0], conf.get("dynamics/eval/batch_size", int))
-                    sched = make_tau_schedule(
-                        k_max=k_max,
-                        schedule=conf.get("dynamics/eval/schedule", str),
-                        d=conf.get("dynamics/eval/d", float)
-                    )
-
-                    run_eval(
-                        tokenizer=tokenizer,
-                        dyn=model_module,
-                        frames=frames[:B_eval],
-                        actions=actions[:B_eval] if actions is not None else None,
-                        act_mask=None,
-                        H=H, W=W, C=C, patch=patch,
-                        packing_factor=packing_factor,
-                        k_max=k_max,
-                        ctx_length=conf.get("dynamics/eval/ctx", int),
-                        horizon=conf.get("dynamics/eval/horizon", int),
-                        sched=sched,
-                        max_items=conf.get("dynamics/eval/max_items", int),
-                        step=step,
-                    )
-
-                    torch.cuda.empty_cache()
-
-                # ---- ckpt ----
-                if is_rank0() and save_every > 0 and (step % save_every == 0):
-                    ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
-                    model_module.save_checkpoint(ckpt_path, step, epoch, best_val_loss, full_config=conf.asdict())
-                    model_module.save_checkpoint(ckpt_dir / "latest.pt", step, epoch, best_val_loss, full_config=conf.asdict())
-
-                if step >= max_steps:
-                    break
-
-            start_epoch = epoch + 1
 
     if ddp:
         dist.barrier()

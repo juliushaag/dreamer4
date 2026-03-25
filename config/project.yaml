@@ -1,9 +1,8 @@
 seed: 0
 
-dmc_data: $(dmc_data.yaml)
-robocasa_data: $(robocasa_data.yaml)
+compile: True
 
-dataset: robocasa
+dataset: $(robocasa_data.yaml)
 
 tokenizer: $(tokenizer.yaml)
 dynamics: $(dynamics.yaml)

@@ -11,9 +11,6 @@ n_register: 4
 n_agent: 1
 space_mode: wm_agent_isolated
 
-parallel_alpha: 1.0
-parallel_beta: 1.0
-
 # Attention configuration
 attention:
   type: "GQA"  # "MHA" or "GQA"

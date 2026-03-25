@@ -15,14 +15,14 @@ Returns a dict per sample with obs, act, act_mask, rew, etc.
 """
 import os
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import h5py
 import torch
 from torch.utils.data import Dataset
 from miniconf import configclass, config_field
 
-from .dataset_utils import DemoCache, TrajectorySubset, collate_batch, split_by_trajectory_generic
+from .dataset_utils import TrajectorySubset, collate_batch, register_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -38,31 +38,28 @@ class RoboCasaDataset(Dataset):
         self,
         data_root: str,
         tasks: List[str],
-        seq_len: int,
-        img_size: int,
-        action_dim: int = 12,
+        sequence_length: int,
+        image_height: int,
+        image_width : int,
+        action_dim: int,
+        hdf5_key: str,
         lang_dim: int = 512,
-        hdf5_key: str = "demo_gentex_im128_randcams.hdf5",
         image_key: str = "robot0_agentview_left_image",
         action_key: str = "actions",
-        verbose: bool = True
+        verbose: bool = True,
+        **kwargs
     ):
         super().__init__()
-        
+        self.hdf5_key = hdf5_key
+        self.data_root = data_root
         self.image_key = image_key
         self.action_key = action_key
         self.verbose = verbose
-        self.H = img_size
-        self.W = img_size
+        self.H = image_height
+        self.W = image_width
         self.A = action_dim
-        self.T = seq_len
-        
-        # Discover tasks from data_root
-        found_tasks = self._discover_tasks()
-        
-        # Filter to requested tasks
-        task_list = set(tasks).intersection(found_tasks) if tasks is not None else found_tasks
-        
+        self.T = sequence_length
+
         # Storage
         self._tasks = []
         self._hdf5_paths = []
@@ -71,6 +68,13 @@ class RoboCasaDataset(Dataset):
         self._valid_starts = []  # valid start indices per task: list of (demo_idx, start_idx)
         self._cum_counts = []
         
+        
+        # Discover tasks from data_root
+        found_tasks = self._discover_tasks()
+        
+        # Filter to requested tasks
+        task_list = found_tasks
+   
         # Per-task metadata
         self._lang_embs = []
         self._zero_lang = torch.zeros(lang_dim, dtype=torch.float32)
@@ -145,8 +149,8 @@ class RoboCasaDataset(Dataset):
 
         self.num_tasks = len(self._tasks)
         assert self.num_tasks > 0, f"No tasks found in {self.data_root}"
-        if self.verbose:
-            print(f"[RoboCasaDataset] Total: {self._cum_counts[-1]:,} sequences across {self.num_tasks} tasks")
+        
+        # print(f"[RoboCasaDataset] Total: {self._cum_counts[-1]:,} sequences across {self.num_tasks} tasks")
     
     def _discover_tasks(self) -> Dict[str, str]:
         """Discover all tasks from the data_root directory.
@@ -191,8 +195,7 @@ class RoboCasaDataset(Dataset):
                             task_name = f"{category}/{task}"
                             found_tasks[task_name] = hdf5_path
         
-        if self.verbose:
-            print(f"[RoboCasaDataset] Found {len(found_tasks)} tasks in {self.data_root}")
+        # print(f"[RoboCasaDataset] Found {len(found_tasks)} tasks in {self.data_root}")
         
         return found_tasks
     
@@ -294,49 +297,78 @@ class RoboCasaDataset(Dataset):
         }
     
     def close(self):
-        """Close all HDF5 file handles and clear cache."""
-        for f in self._hdf5_handles.values():
-            try:
-                f.close()
-            except:
-                pass
-        self._hdf5_handles.clear()
+        ...
     
+    def get_episode_id(self, item):
+        return item[0]
+    
+    def get_valid_starts(self, task_idx):
+        return self._valid_starts[task_idx]
+    
+
+    def split_by_trajectory(
+        self,
+        val_fraction: float = 0.1,
+        seed: int = 42
+    ) -> Tuple[TrajectorySubset, TrajectorySubset]:
+
+        rng = torch.Generator().manual_seed(seed)
+        
+        train_indices = []
+        val_indices = []
+        
+        global_offset = 0
+        
+        for task_idx in range(self.num_tasks):
+            valid_starts = self.get_valid_starts(task_idx)
+            
+            # Build mapping from episode to local indices
+            ep_to_local_indices = {}
+            for local_idx, item in enumerate(valid_starts):
+                ep_id = self.get_episode_id(item)
+                if ep_id not in ep_to_local_indices:
+                    ep_to_local_indices[ep_id] = []
+                ep_to_local_indices[ep_id].append(local_idx)
+            
+            # Get unique episodes
+            unique_eps = list(ep_to_local_indices.keys())
+            n_eps = len(unique_eps)
+            
+            if n_eps == 0:
+                global_offset += len(list(valid_starts)) if hasattr(valid_starts, '__len__') else 0
+                continue
+            
+            # Shuffle episodes
+            perm = torch.randperm(n_eps, generator=rng).tolist()
+            unique_eps_shuffled = [unique_eps[i] for i in perm]
+            
+            # Split episodes into train/val
+            n_val = max(1, int(n_eps * val_fraction)) if n_eps > 1 else 0
+            val_eps = set(unique_eps_shuffled[:n_val])
+            
+            # Assign sequences to train or val based on their episode
+            num_valid = len(list(valid_starts)) if not hasattr(valid_starts, '__len__') else len(valid_starts)
+            for local_idx, item in enumerate(valid_starts):
+                global_idx = global_offset + local_idx
+                ep_id = self.get_episode_id(item)
+                if ep_id in val_eps:
+                    val_indices.append(global_idx)
+                else:
+                    train_indices.append(global_idx)
+            
+            global_offset += num_valid
+        
+        train_indices = torch.tensor(train_indices, dtype=torch.long)
+        val_indices = torch.tensor(val_indices, dtype=torch.long)
+        
+        return TrajectorySubset(self, train_indices), TrajectorySubset(self, val_indices)
+
+
     def __del__(self):
         self.close()
 
 
-def split_by_trajectory(dataset: RoboCasaDataset, val_fraction: float = 0.1, seed: int = 42) -> tuple:
-    """
-    Split a RoboCasaDataset into train and validation sets, respecting trajectory boundaries.
-    
-    For each task, we identify unique demos and split them into train/val sets.
-    All sequences from a given demo go entirely to either train or val.
-    
-    Args:
-        dataset: The RoboCasaDataset to split
-        val_fraction: Fraction of demos to use for validation (default 0.1)
-        seed: Random seed for reproducibility
-        
-    Returns:
-        (train_dataset, val_dataset) tuple of TrajectorySubset objects
-    """
-    def get_valid_starts(task_idx):
-        return dataset._valid_starts[task_idx]
-    
-    def get_episode_id(item):
-        # item is (demo_idx, start_idx), use demo_idx as episode ID
-        return item[0]
-    
-    return split_by_trajectory_generic(
-        dataset=dataset,
-        num_tasks=dataset.num_tasks,
-        get_valid_starts=get_valid_starts,
-        get_episode_id=get_episode_id,
-        val_fraction=val_fraction,
-        seed=seed
-    )
-
+register_dataset("robocasa", RoboCasaDataset)
 
 if __name__ == "__main__":
     # Test the dataset
@@ -370,12 +402,7 @@ if __name__ == "__main__":
         print(f'rew shape: {sample["rew"].shape}')
         print(f'lang_emb shape: {sample["lang_emb"].shape}')
         print(f'emb_id: {sample["emb_id"]}')
-        
-        # Test train/val split
-        print('\n--- Train/val split test ---')
-        train_ds, val_ds = split_by_trajectory(ds, val_fraction=0.1)
-        print(f'Train size: {len(train_ds)}, Val size: {len(val_ds)}')
-        
+    
         # Test loading a batch
         print('\n--- Batch loading test ---')
         t0 = time.time()

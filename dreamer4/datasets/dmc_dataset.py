@@ -17,9 +17,7 @@ from typing import Dict, Optional, List
 
 import torch
 from torch.utils.data import Dataset
-from miniconf import configclass, config_field
-
-from .dataset_utils import DemoCache, TrajectorySubset, collate_batch
+from .dataset_utils import TrajectorySubset, register_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -382,70 +380,69 @@ class DMCDataset(Dataset):
         }
 
 
-# Re-export collate_batch for backward compatibility
-# (already imported from dataset_utils at top of file)
-
-
-def split_by_trajectory(dataset: DMCDataset, val_fraction: float = 0.1, seed: int = 42) -> tuple:
-    """
-    Split a WMDataset into train and validation sets, respecting trajectory boundaries.
-    
-    For each task, we identify unique episodes and split them into train/val sets.
-    All sequences from a given episode go entirely to either train or val.
-    
-    Args:
-        dataset: The WMDataset to split
-        val_fraction: Fraction of episodes to use for validation (default 0.1)
-        seed: Random seed for reproducibility
+    @classmethod
+    def split_by_trajectory(dataset, val_fraction: float = 0.1, seed: int = 42) -> tuple:
+        """
+        Split a WMDataset into train and validation sets, respecting trajectory boundaries.
         
-    Returns:
-        (train_dataset, val_dataset) tuple of TrajectorySubset objects
-    """
-    rng = torch.Generator().manual_seed(seed)
-    
-    train_indices = []
-    val_indices = []
-    
-    global_offset = 0
-    
-    for task_idx in range(dataset.num_tasks):
-        valid_starts = dataset.valid_starts[task_idx]  # Tensor of valid start indices
-        ep_ids = dataset.ep[task_idx]  # Episode IDs for all frames
+        For each task, we identify unique episodes and split them into train/val sets.
+        All sequences from a given episode go entirely to either train or val.
         
-        # For each valid start, get its episode ID
-        start_ep_ids = ep_ids[valid_starts]  # Episode ID for each valid sequence
+        Args:
+            dataset: The WMDataset to split
+            val_fraction: Fraction of episodes to use for validation (default 0.1)
+            seed: Random seed for reproducibility
+            
+        Returns:
+            (train_dataset, val_dataset) tuple of TrajectorySubset objects
+        """
+        rng = torch.Generator().manual_seed(seed)
         
-        # Get unique episodes
-        unique_eps = torch.unique(start_ep_ids)
-        n_eps = len(unique_eps)
+        train_indices = []
+        val_indices = []
         
-        if n_eps == 0:
+        global_offset = 0
+        
+        for task_idx in range(dataset.num_tasks):
+            valid_starts = dataset.valid_starts[task_idx]  # Tensor of valid start indices
+            ep_ids = dataset.ep[task_idx]  # Episode IDs for all frames
+            
+            # For each valid start, get its episode ID
+            start_ep_ids = ep_ids[valid_starts]  # Episode ID for each valid sequence
+            
+            # Get unique episodes
+            unique_eps = torch.unique(start_ep_ids)
+            n_eps = len(unique_eps)
+            
+            if n_eps == 0:
+                global_offset += len(valid_starts)
+                continue
+            
+            # Shuffle episodes
+            perm = torch.randperm(n_eps, generator=rng)
+            unique_eps_shuffled = unique_eps[perm]
+            
+            # Split episodes into train/val
+            n_val = max(1, int(n_eps * val_fraction)) if n_eps > 1 else 0
+            val_eps = set(unique_eps_shuffled[:n_val].tolist())
+            
+            # Assign sequences to train or val based on their episode
+            for local_idx, ep_id in enumerate(start_ep_ids.tolist()):
+                global_idx = global_offset + local_idx
+                if ep_id in val_eps:
+                    val_indices.append(global_idx)
+                else:
+                    train_indices.append(global_idx)
+            
             global_offset += len(valid_starts)
-            continue
         
-        # Shuffle episodes
-        perm = torch.randperm(n_eps, generator=rng)
-        unique_eps_shuffled = unique_eps[perm]
+        train_indices = torch.tensor(train_indices, dtype=torch.long)
+        val_indices = torch.tensor(val_indices, dtype=torch.long)
         
-        # Split episodes into train/val
-        n_val = max(1, int(n_eps * val_fraction)) if n_eps > 1 else 0
-        val_eps = set(unique_eps_shuffled[:n_val].tolist())
-        
-        # Assign sequences to train or val based on their episode
-        for local_idx, ep_id in enumerate(start_ep_ids.tolist()):
-            global_idx = global_offset + local_idx
-            if ep_id in val_eps:
-                val_indices.append(global_idx)
-            else:
-                train_indices.append(global_idx)
-        
-        global_offset += len(valid_starts)
-    
-    train_indices = torch.tensor(train_indices, dtype=torch.long)
-    val_indices = torch.tensor(val_indices, dtype=torch.long)
-    
-    return TrajectorySubset(dataset, train_indices), TrajectorySubset(dataset, val_indices)
+        return TrajectorySubset(dataset, train_indices), TrajectorySubset(dataset, val_indices)
 
+
+register_dataset("dmc", DMCDataset)
 
 if __name__ == "__main__":
     from miniconf import MiniConf

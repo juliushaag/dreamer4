@@ -13,47 +13,13 @@ from einops import rearrange, repeat
 from miniconf import configclass, MiniConf, config_field
 import lpips
 
-from attention import MultiheadSelfAttention, GroupedQueryAttention
+from attention import GroupedQueryAttention
 
 
 # =============================================================================
 # Learning Rate Scheduler
 # =============================================================================
 
-def create_cosine_scheduler(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-    max_steps: int,
-    min_lr: float,
-    base_lr: float,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """
-    Create a learning rate scheduler with linear warmup followed by cosine decay.
-    
-    Args:
-        optimizer: The optimizer to schedule
-        warmup_steps: Number of warmup steps (linear increase from 0 to base_lr)
-        max_steps: Total training steps
-        min_lr: Minimum LR at end of cosine decay
-        base_lr: Base learning rate (peak after warmup)
-        
-    Returns:
-        LambdaLR scheduler
-    """
-    min_lr_ratio = min_lr / base_lr if base_lr > 0 else 0.0
-    
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            # Linear warmup: 0 -> 1
-            return float(step) / float(max(1, warmup_steps))
-        else:
-            # Cosine decay: 1 -> min_lr_ratio
-            progress = (step - warmup_steps) / float(max(1, max_steps - warmup_steps))
-            progress = min(1.0, progress)  # Clamp to avoid going below min_lr
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-    
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 class Modality(IntEnum):
     LATENT = -1
@@ -123,7 +89,7 @@ class MAEReplacer(nn.Module):
         self.mask_token = nn.Parameter(torch.empty(d_model))
         nn.init.normal_(self.mask_token, std=0.02)
 
-    def forward(self, patches_btnd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, patches_btnd: torch.Tensor, disable_mae = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         patches: (B,T,Np,D)
         returns:
@@ -135,7 +101,7 @@ class MAEReplacer(nn.Module):
         device = patches_btnd.device
 
         # fast path: deterministic "no MAE"
-        if self.p_min == 0.0 and self.p_max == 0.0:
+        if (self.p_min == 0.0 and self.p_max == 0.0) or disable_mae:
             keep_prob = torch.ones((B, T, 1), device=device, dtype=patches_btnd.dtype)
             mae_mask = torch.zeros((B, T, Np, 1), device=device, dtype=torch.bool)
             return patches_btnd, mae_mask, keep_prob
@@ -167,7 +133,6 @@ class MLP(nn.Module):
 
 @configclass
 class SpaceSelfAttentionModality(nn.Module):
-    attention_type: str = config_field("attention/type")
     n_latents: float = config_field("num_latents")
     d_model: float = config_field("latent_dim")
 
@@ -184,10 +149,7 @@ class SpaceSelfAttentionModality(nn.Module):
 
         self._use_mask = self.mode not in ("wm_agent",)
 
-        if self.attention_type == "MHA":
-            self.attn = MultiheadSelfAttention(self.d_model, **self._config.select("attention"))
-        elif self.attention_type == "GQA":
-            self.attn = GroupedQueryAttention(self.d_model, **self._config.select("attention"))
+        self.attn = GroupedQueryAttention(self.d_model, **self._config.select("attention"))
     
     def _build_allow(self, S: int) -> torch.Tensor:
         device = self.modality_ids.device
@@ -234,20 +196,14 @@ class SpaceSelfAttentionModality(nn.Module):
 
 @configclass
 class TimeSelfAttention(nn.Module):
-    attention_type: str = config_field("attention/type")
     latents_only: bool = config_field("latents_only_time")
     n_latents: float = config_field("num_latents")
     d_model: float = config_field("latent_dim")
 
     def __init__(self):
         super().__init__()   
-      
-        if self.attention_type == "MHA":
-            self.attn = MultiheadSelfAttention(self.d_model, **self._config.select("attention"))
-        elif self.attention_type == "GQA":
-            self.attn = GroupedQueryAttention(self.d_model, **self._config.select("attention"))
-
-        
+        self.attn = GroupedQueryAttention(self.d_model, **self._config.select("attention"))
+   
     def forward(self, x: torch.Tensor):
         if self.latents_only:
             return self.forward_latents_only(x)
@@ -270,13 +226,11 @@ class TimeSelfAttention(nn.Module):
 
 
 @configclass
-class ParallelBlockCausalLayer(nn.Module):
+class BlockCausalLayer(nn.Module):
     d_model: int = config_field("latent_dim")
     time_every: float = config_field("time_embedding_every")
     mlp_ratio: float = config_field("mlp_ratio")
     dropout: float = config_field("dropout")
-    parallel_alpha: float = config_field("parallel_alpha")
-    parallel_beta: float = config_field("parallel_beta")
     
     def __init__(self, layer_index : int, modality_ids: torch.Tensor, space_mode: str):
         super().__init__()
@@ -299,8 +253,6 @@ class ParallelBlockCausalLayer(nn.Module):
             nn.Dropout(self.dropout, True),
         )
         
-        self.attn_scale = nn.Parameter(torch.tensor(self.parallel_alpha))
-        self.mlp_scale = nn.Parameter(torch.tensor(self.parallel_beta))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.norm(x)
@@ -312,7 +264,7 @@ class ParallelBlockCausalLayer(nn.Module):
             
         mlp_out = self.mlp(x_norm)
         
-        x = x + self.attn_scale * attn_out + self.mlp_scale * mlp_out
+        x = x + attn_out + mlp_out
         return x
 
 
@@ -328,7 +280,7 @@ class BlockCausalTransformer(nn.Module):
     ):
         super().__init__()
         self.layers = nn.Sequential(*[
-            ParallelBlockCausalLayer(
+            BlockCausalLayer(
                 layer_index=i,
                 modality_ids=modality_ids,
                 space_mode=space_mode,
@@ -377,11 +329,11 @@ class Encoder(nn.Module):
         self.latents = nn.Parameter(torch.empty(self.n_latents, self.d_model))
         nn.init.normal_(self.latents, std=0.02)
 
-    def forward(self, patch_tokens_btnd: torch.Tensor):
+    def forward(self, patch_tokens_btnd: torch.Tensor, disable_mae=False):
         B, T, Np, Dp = patch_tokens_btnd.shape
         
         proj = self.patch_proj(patch_tokens_btnd)
-        proj_masked, mae_mask, keep_prob = self.mae(proj)
+        proj_masked, mae_mask, keep_prob = self.mae(proj, disable_mae)
 
         lat = repeat(self.latents, 'l d -> b t l d', b=B, t=T)
         tokens = torch.cat([lat, proj_masked], dim=2)
@@ -433,183 +385,34 @@ class Decoder(nn.Module):
 @configclass
 class Tokenizer(nn.Module):
 
-    H : int = config_field("data/image_height")
-    W : int = config_field("data/image_width")
-    C : int = config_field("data/image_channels")
-
     num_latents : int = config_field("num_latents", ge=1)
-
     d_bottleneck : int = config_field("bottleneck_dim")
-
-    lr : float = config_field("optim/lr")
-    weight_decay : float = config_field("optim/weight_decay")
-    max_steps : int = config_field("optim/max_steps")
-    warmup_steps : int = config_field("optim/warmup_steps")
-    min_lr : float = config_field("optim/min_lr")
-
-    lpips_fn : str = config_field("lpips/net")
-    lpips_frac : float = config_field("lpips/frac")
-    lpips_weight : float = config_field("lpips/weight")
-
-    compile : bool = config_field("compile")
-
+  
     P : int = config_field("patch_size")  # This is actually patch_size (kernel/stride)
         
-
-    def __init__(self, device : str):
+    def __init__(self, C, H, W):
         super().__init__()
+        
+        assert H % self.P == 0 and W % self.P == 0
+        self.n_patches = (H // self.P) * (W // self.P)  # number of patches
+        self.d_patch = self.P * self.P * C              # patch dimension (pixels per patch)
 
-        
-        assert self.H % self.P == 0 and self.W % self.P == 0
-        self.n_patches = (self.H // self.P) * (self.W // self.P)  # number of patches
-        self.d_patch = self.P * self.P * self.C              # patch dimension (pixels per patch)
-
-        self.encoder = Encoder(n_patches=self.n_patches, d_patch=self.d_patch, **self._config.select(data="data"))
-        self.decoder = Decoder(n_patches=self.n_patches, d_patch=self.d_patch, **self._config.select(data="data"))
-
-        self.device = device
-
-        self.opt = torch.optim.AdamW(
-            self.parameters(), 
-            lr=self.lr, 
-            weight_decay=self.weight_decay, 
-            fused=torch.cuda.is_available()
-        )
-        
-        # Learning rate scheduler with warmup + cosine decay
-        self.scheduler = create_cosine_scheduler(
-            optimizer=self.opt,
-            warmup_steps=self.warmup_steps,
-            max_steps=self.max_steps,
-            min_lr=self.min_lr,
-            base_lr=self.lr,
-        )
-   
-        
-        self.lpips = lpips.LPIPS(net=self.lpips_fn, verbose=False).to(self.device)
-        self.lpips.eval()
-        self.lpips.requires_grad_(False)
-
-        if self.compile:
-            self.train_step = torch.compile(self.train_step)
-
-            self.encode = torch.compile(self.encode)
-            self.decode = torch.compile(self.decode)
-
-    @classmethod
-    def from_checkpoint(cls, checkpoint: Path, device: str = "cpu") -> tuple["Tokenizer", dict]:
-        checkpoint = Path(checkpoint)
-        assert checkpoint.exists(), f"Checkpoint not found: {checkpoint}"
-
-        ckpt = torch.load(checkpoint.as_posix(), map_location="cpu")
-        config = ckpt["config"]
-        
-        conf = MiniConf(config)  
-        
-        ds_name = conf.get("dataset")
-        data_config_key = f"{ds_name}_data" if ds_name != "dmc" else "dmc_data"
-        tok = cls(device=device, **conf.select("tokenizer", data=data_config_key))
-        tok.load_state_dict(ckpt["model"], strict=True)
-        
-        # Move model to device BEFORE loading optimizer state
-        # This ensures optimizer state tensors are created on the correct device
-        # (required for fused AdamW which expects all tensors on the same device)
-        tok.to(device)
-        
-        tok.opt.load_state_dict(ckpt["opt"])
-        
-        # Move optimizer state tensors to device (they were loaded on CPU)
-        for state in tok.opt.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
-        
-        # Restore scheduler state if present
-        if "scheduler" in ckpt and ckpt["scheduler"] is not None:
-            tok.scheduler.load_state_dict(ckpt["scheduler"])
-        
-        return tok, dict(
-            step=ckpt["step"], 
-            epoch=ckpt["epoch"], 
-            config=ckpt["config"],
-            best_val_loss=ckpt.get("best_val_loss", float('inf'))
-        )
-
-    def save_checkpoint(self, path: Path, step: int = 0, epoch: int = 0, best_val_loss: float = float('inf'), full_config: dict = None):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Use full_config if provided, otherwise fall back to self._conf
-        if full_config is not None:
-            config = full_config
-        elif hasattr(self, '_conf') and self._conf is not None:
-            config = self._conf.asdict() if hasattr(self._conf, 'asdict') else self._conf
-        else:
-            config = {}
-        
-        obj = {
-            "step": step,
-            "epoch": epoch,
-            "best_val_loss": best_val_loss,
-            "model": self.state_dict(),
-            "opt": self.opt.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
-            "config": config,
-        }
-        
-        tmp = path.with_suffix(".tmp")
-        torch.save(obj, tmp)
-        tmp.replace(path)
+        self.encoder = Encoder(n_patches=self.n_patches, d_patch=self.d_patch, **self._config.select())
+        self.decoder = Decoder(n_patches=self.n_patches, d_patch=self.d_patch, **self._config.select())
 
     def forward(self, patches_btnd: torch.Tensor):
         z, (mae_mask, keep_prob) = self.encoder(patches_btnd)
         pred = self.decoder(z)
         return pred, mae_mask, keep_prob    
     
-    @torch.no_grad()
     def encode(self, x : torch.Tensor):
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            patches = temporal_patchify(x, self.P)
-            z, _ = self.encoder(patches)
-        return z
-
-    @torch.no_grad()
-    def decode(self, z : torch.Tensor):
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            z = self.decoder(z)
-        return z
-
-
-    def train_step(self, x: torch.Tensor, accumulate: bool = False):
-        """
-        Single training step with optional gradient accumulation.
-        
-        Args:
-            x: Input tensor (B,T,C,H,W) - float [0,1]
-            accumulate: If True, skip optimizer step (for gradient accumulation)
-        """
         patches = temporal_patchify(x, self.P)
- 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            pred, mae_mask, keep_prob = self(patches)
+        z, _ = self.encoder(patches)
+        return z
 
-            # Keep loss computation in autocast for memory efficiency
-            mse = recon_loss_from_mae(pred, patches, mae_mask)
-
-            lp = lpips_on_mae_recon(
-                self.lpips, pred, patches, mae_mask,
-                H=self.H, W=self.W, C=self.C, patch=self.P,
-                subsample_frac=self.lpips_frac
-            )
-            loss = mse + self.lpips_weight * lp
-
-        loss.backward()
-        
-        if not accumulate:
-            self.opt.step()
-            self.opt.zero_grad(set_to_none=True) 
-
-        return loss, mse, lp, keep_prob, mae_mask
+    def decode(self, z : torch.Tensor):
+        z = self.decoder(z)
+        return z
 
 def pack_bottleneck_to_spatial(z_btLd: torch.Tensor, *, n_spatial: int, k: int) -> torch.Tensor:
     """
@@ -736,19 +539,6 @@ class Dynamics(nn.Module):
     time_every: int = config_field("time_embedding_every")
     space_mode: str = config_field("space_mode")
 
-    # Optimizer config (like Tokenizer)
-    lr: float = config_field("optim/lr")
-    weight_decay: float = config_field("optim/weight_decay")
-    grad_clip: float = config_field("optim/grad_clip")
-    max_steps: int = config_field("optim/max_steps")
-    warmup_steps: int = config_field("optim/warmup_steps")
-    min_lr: float = config_field("optim/min_lr")
-    
-    packing_factor: int = config_field("packing_factor")
-    self_fraction: float = config_field("self_fraction")
-    bootstrap_start: int = config_field("bootstrap_start")
-    
-    compile: bool = config_field("training/compile")
 
     def __init__(self, *, tokenizer: Tokenizer, device: str):
         super().__init__()
@@ -756,11 +546,6 @@ class Dynamics(nn.Module):
         self.tokenizer = tokenizer
         self.device = device
 
-        H = tokenizer.H
-        W = tokenizer.W
-        C = tokenizer.C
-
-        patch = tokenizer.n_patches
         n_latents = tokenizer.decoder.n_latents
         d_bottleneck = tokenizer.decoder.d_bottleneck
 
@@ -811,29 +596,9 @@ class Dynamics(nn.Module):
         )
 
         self.flow_x_head = nn.Linear(self.d_model, self.d_spatial)
-        nn.init.zeros_(self.flow_x_head.weight)
+        nn.init.normal_(self.flow_x_head.weight, std=0.001)
         nn.init.zeros_(self.flow_x_head.bias)
 
-        # Create optimizer (like Tokenizer)
-        self.opt = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-            fused=torch.cuda.is_available()
-        )
-
-        # Learning rate scheduler with warmup + cosine decay
-        self.scheduler = create_cosine_scheduler(
-            optimizer=self.opt,
-            warmup_steps=self.warmup_steps,
-            max_steps=self.max_steps,
-            min_lr=self.min_lr,
-            base_lr=self.lr,
-        )
-
-        # Compile if enabled (like Tokenizer)
-        if self.compile:
-            self.train_step = torch.compile(self.train_step)
 
     @classmethod
     def from_checkpoint(cls, checkpoint: Path, tokenizer: Tokenizer, device: str = "cpu") -> tuple["Dynamics", dict]:
@@ -1058,43 +823,3 @@ class Dynamics(nn.Module):
             "loss_self": loss_self.detach(),
             "sigma_mean": sigma_full.mean().detach(),
         }
-
-def recon_loss_from_mae(pred : torch.Tensor, target : torch.Tensor, mask : torch.Tensor):
-    # Compute masked squared error without cloning pred
-    diff_sq = (pred - target).square_()
-    diff_sq.mul_(mask)
-
-    denom = mask.sum().float().clamp_min_(1.0) * diff_sq.shape[-1]
-
-    return diff_sq.sum(dtype=torch.float32) / denom
-
-
-def lpips_on_mae_recon(
-    lpips_fn,
-    pred_btnd: torch.Tensor,
-    target_btnd: torch.Tensor,
-    mae_mask_btNp1: torch.Tensor,
-    *,
-    H: int, W: int, C: int, patch: int,
-    subsample_frac: float = 1.0,
-) -> torch.Tensor:
-    
-    recon_masked_btnd = torch.where(mae_mask_btNp1, pred_btnd, target_btnd)
-    recon = temporal_unpatchify(recon_masked_btnd,  H, W, C, patch)
-    tgt   = temporal_unpatchify(target_btnd,        H, W, C, patch)
-
-    if subsample_frac < 1.0:
-        B, T = recon.shape[:2]
-        step = max(1, int(1.0 / subsample_frac))
-        recon = recon[:, ::step]
-        tgt   = tgt[:, ::step]
-
-    recon = (recon.clamp(0, 1) * 2.0 - 1.0)
-    tgt   = (tgt.clamp(0, 1)   * 2.0 - 1.0)
-
-    recon = rearrange(recon, 'b t c h w -> (b t) c h w')
-    tgt   = rearrange(tgt,   'b t c h w -> (b t) c h w')
-    
-    lp = lpips_fn(recon, tgt)
-
-    return lp.mean()
