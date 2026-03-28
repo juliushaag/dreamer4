@@ -8,6 +8,7 @@ dependencies = [
     "einops>=0.8.2",
     "h5py>=3.16.0",
     "lpips>=0.1.4",
+    "opencv-python>=4.13.0.92",
     "torch>=2.11.0",
     "wandb>=0.25.1",
 ]
