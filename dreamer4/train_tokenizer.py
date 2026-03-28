@@ -48,7 +48,7 @@ def recon_loss_from_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Te
 
 
 def lpips_on_mae_recon(
-    lpips_fn,
+    lpips_model,
     pred_btnd: torch.Tensor,
     target_btnd: torch.Tensor,
     mae_mask_btNp1: torch.Tensor,
@@ -57,13 +57,13 @@ def lpips_on_mae_recon(
     W: int,
     C: int,
     patch: int,
-    subsample_frac: float = 1.0,
 ) -> torch.Tensor:
 
     recon_masked_btnd = torch.where(mae_mask_btNp1, pred_btnd, target_btnd)
     recon = temporal_unpatchify(recon_masked_btnd, H, W, C, patch)
     tgt = temporal_unpatchify(target_btnd, H, W, C, patch)
 
+    subsample_frac = lpips_model.frac
     if subsample_frac < 1.0:
         step = max(1, int(1.0 / subsample_frac))
         recon = recon[:, ::step]
@@ -75,25 +75,26 @@ def lpips_on_mae_recon(
     recon = einops.rearrange(recon, "b t c h w -> (b t) c h w")
     tgt = einops.rearrange(tgt, "b t c h w -> (b t) c h w")
 
-    lp = lpips_fn(recon, tgt)
+    lp = lpips_model(recon, tgt)
 
     return lp.mean()
 
 
 @torch.inference_mode()
 def run_validation(
+    conf : MiniConf,
     model: torch.nn.Module,
     val_loader: torch.utils.data.DataLoader,
     device,
-    P,
-    H,
-    W,
-    C,
     lpips,
-    lpips_frac=0.25,
     ddp=False,
     world_size=None,
 ):
+    H = conf.get("dataset/image_height", int)
+    W = conf.get("dataset/image_width", int)
+    P = conf.get("tokenizer/patch_size", int)
+    C = 3  # RGB
+
     model.eval()
     max_steps = 100
     total_mse = torch.zeros(max_steps)
@@ -125,8 +126,7 @@ def run_validation(
                 H=H,
                 W=W,
                 C=C,
-                patch=P,
-                subsample_frac=lpips_frac,
+                patch=P
             )
 
         total_lpips[i] = lpips_val * B
@@ -156,11 +156,18 @@ def run_validation(
 
     return metrics
 
-
 @torch.inference_mode()
 def run_visualization(
-    model: torch.nn.Module, x, P, viz_max_T: int, viz_max_items: int
+    conf : MiniConf, model: torch.nn.Module, val_loader, device
 ) -> np.ndarray:
+
+    viz_max_items = conf.get("tokenizer/training/viz_max_items")
+    viz_max_T = conf.get("tokenizer/training/viz_max_T")
+    P = conf.get("tokenizer/patch_size", int)
+
+    x = next(iter(val_loader))["obs.images"].to(device, non_blocking=True)
+
+
     B, T, C, H, W = x.shape
     Tv = min(T, viz_max_T)
     Bv = min(B, viz_max_items)
@@ -193,6 +200,65 @@ def run_visualization(
 
     return big
 
+def train_step(conf : MiniConf, model : torch.nn.Module, opt : torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LRScheduler, train_loader, device : torch.device, lpips_model):
+    
+    grad_accum = conf.get("tokenizer/training/grad_accum")
+
+    H = conf.get("dataset/image_height", int)
+    W = conf.get("dataset/image_width", int)
+    P = conf.get("tokenizer/patch_size", int)
+    C = 3  # RGB
+    
+    train_stats = defaultdict(lambda: torch.zeros((grad_accum,)))
+
+    step_t0 = time.monotonic()
+
+    model.train()
+    opt.zero_grad(set_to_none=True)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for gs in range(grad_accum):
+            batch = next(train_loader)
+            x = batch["obs.images"].to(device, non_blocking=True)
+
+            patches = temporal_patchify(x, P)
+            pred, mae_mask, keep_prob = model(patches)
+
+            mse = recon_loss_from_mae(pred, patches, mae_mask)
+
+            lp = lpips_on_mae_recon(
+                lpips_model,
+                pred,
+                patches,
+                mae_mask,
+                H=H,
+                W=W,
+                C=C,
+                patch=P,
+            )
+
+            loss: torch.Tensor = (mse + lpips_model.weight * lp) / grad_accum
+            loss.backward() 
+
+
+            train_stats["mae_mask"][gs] = mae_mask.float().mean().detach()
+            train_stats["keep_prob"][gs] = keep_prob.mean().detach()
+            train_stats["mse_losses"][gs] = mse.detach()
+            train_stats["lpips_losses"][gs] = lp.detach()
+            train_stats["total_losses"][gs] = loss.detach()
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    scheduler.step()
+
+    step_time = time.monotonic() - step_t0
+
+    for k in train_stats:
+        train_stats[k] = train_stats[k].mean()
+
+    train_stats["step_time"] = step_time
+
+    return train_stats
+
 
 def train(args):
 
@@ -212,8 +278,8 @@ def train(args):
     # Get image dimensions from the appropriate data config
     H = conf.get(f"dataset/image_height", int)
     W = conf.get(f"dataset/image_width", int)
-    C = 3  # RGB
     P = conf.get("tokenizer/patch_size", int)
+    C = 3  # RGB
 
     assert H % P == 0 and W % P == 0
 
@@ -259,10 +325,11 @@ def train(args):
         model.decoder.transformer = torch.compile(
             model.decoder.transformer, mode="default"
         )
+        
     # 2. Load dataset
     train_dataset, val_dataset = load_datasets(conf.get("dataset"))
 
-    if is_rank0():
+    if is_rank0(): 
         print(
             f"[Data] Train: {len(train_dataset):,} sequences, Val: {len(val_dataset):,} sequences"
         )
@@ -281,6 +348,7 @@ def train(args):
         val_sampler = DistributedSampler(
             val_dataset, num_replicas=world_size, rank=rank, shuffle=False
         )
+
     else:
         train_sampler = None
         val_sampler = None
@@ -302,20 +370,12 @@ def train(args):
         **conf.get("tokenizer/dataloader"),
     )
 
-    if is_rank0():
-        print("Loaded dataloaders and datasets")
-
     # 3. Lpips
-    lpips_fn: str = conf.get("tokenizer/lpips/net")
-    lpips_frac: float = conf.get("tokenizer/lpips/frac")
-    lpips_weight: float = conf.get("tokenizer/lpips/weight")
-
-    lpips_model = lpips.LPIPS(net=lpips_fn, verbose=False).to(device)
+    lpips_model = lpips.LPIPS(net=conf.get("tokenizer/lpips/net"), verbose=False).to(device)
     lpips_model.eval()
     lpips_model.requires_grad_(False)
-
-    if is_rank0():
-        print("Loaded lpips loss model")
+    lpips_model.frac = conf.get("tokenizer/lpips/frac")
+    lpips_model.weight =  conf.get("tokenizer/lpips/weight")
 
     # ---- wandb ----
     if is_rank0():
@@ -339,80 +399,41 @@ def train(args):
     print_every = conf.get("tokenizer/training/print_every")
     save_every = conf.get("tokenizer/training/save_every")
     viz_every = conf.get("tokenizer/training/viz_every")
-    viz_max_items = conf.get("tokenizer/training/viz_max_items")
-    viz_max_T = conf.get("tokenizer/training/viz_max_T")
 
     # Validation config with defaults
     val_every = conf.get("tokenizer/training/val_every", int)
-
-    val_lpips_frac = conf.get("tokenizer/training/val_lpips_frac", float)
-
-    grad_accum = conf.get("tokenizer/training/grad_accum")
-
+    
     train_loader = itertools.cycle(train_loader)
 
-    print("Starting training run on step", state.steps)
+    print(f"Starting training run on step {state.steps} and training for {max_steps}")
+
     model.train()
     start_step = state.steps
     for state.steps in range(start_step, max_steps):
-        aux = defaultdict(lambda: torch.zeros((grad_accum,)))
-
-        step_t0 = time.monotonic()
-
-        model.train()
-        opt.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-            for gs in range(grad_accum):
-                batch = next(train_loader)
-                x = batch["obs.images"].to(device, non_blocking=True)
-
-                patches = temporal_patchify(x, P)
-                pred, mae_mask, keep_prob = model(patches)
-
-                mse = recon_loss_from_mae(pred, patches, mae_mask)
-
-                lp = lpips_on_mae_recon(
-                    lpips_model,
-                    pred,
-                    patches,
-                    mae_mask,
-                    H=H,
-                    W=W,
-                    C=C,
-                    patch=P,
-                    subsample_frac=lpips_frac,
-                )
-
-                loss: torch.Tensor = (mse + lpips_weight * lp) / grad_accum
-                loss.backward()
-
-                aux["mse_losses"][gs] = mse.detach()
-                aux["lpips_losses"][gs] = lp.detach()
-                aux["total_losses"][gs] = loss.detach()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        scheduler.step()
-
-        step_time = time.monotonic() - step_t0
-
-        for k in aux:
-            aux[k] = aux[k].mean()
+        
+        train_stats = train_step(
+            conf=conf,
+            model=model, 
+            opt=state.opt, 
+            scheduler=state.scheduler, 
+            train_loader=train_loader, 
+            device=device, 
+            lpips_model=lpips_model,
+        )
+        
 
         # ---- validation ----
         if is_rank0() and (state.steps % val_every == 0):
             torch.cuda.empty_cache()
 
             val_metrics = run_validation(
-                model,
-                val_loader,
-                device,
-                P,
-                H,
-                W,
-                C,
-                lpips_model,
-                lpips_frac=val_lpips_frac,
+                conf=conf,
+                model=model,
+                val_loader=val_loader,
+                device=device,
+                lpips=lpips_model,
+                ddp=ddp,
+                world_size=world_size
             )
 
             wandb.log(val_metrics, step=state.steps)
@@ -433,39 +454,37 @@ def train(args):
 
         # ---- logging ----
         if is_rank0() and (state.steps % log_every == 0):
-            psnr = 10.0 * torch.log10(1.0 / torch.clamp_min(aux["mse_losses"], 1e-10))
+            psnr = 10.0 * torch.log10(1.0 / torch.clamp_min(train_stats["mse_losses"], 1e-10))
             wandb.log(
                 {
                     **{
-                        f"train/{k}": aux[f"{k}_losses"].item()
-                        for k in ["mse", "total", "lpips"]
+                        f"train/{k}": train_stats[f"{k}"].item()
+                        for k in ["mse_losses", "total_losses", "lpips_losses", "keep_prob", "mae_mask"]
                     },
-                    "train/psnr": float(psnr.item()),
-                    "stats/keep_prob": float(keep_prob.mean().item()),
-                    "stats/masked_frac": float(mae_mask.float().mean().item()),
+                    "train/psnr": psnr.item(),
                     "lr": float(opt.param_groups[0]["lr"]),
                     "time/hrs": (time.monotonic() - t0) / 3600.0,
-                    "time/step_ms": step_time * 1000.0,
-                    "time/samples_per_sec": x.shape[0] * grad_accum / step_time,
+                    "time/step_ms": train_stats["step_time"] * 1000.0,
                 },
                 step=state.steps,
             )
 
         if is_rank0() and (state.steps % print_every == 0):
-            psnr = 10.0 * torch.log10(1.0 / aux["mse_losses"].clamp_min(1e-10))
+            psnr = 10.0 * torch.log10(1.0 / train_stats["mse_losses"].clamp_min(1e-10))
             lr = opt.param_groups[0]["lr"]
             print(
-                f"step {state.steps:07d} | loss={aux['total_losses'].item():.6f} "
-                f"| mse={aux['mse_losses'].item():.6f} | lpips={aux['lpips_losses'].item():.4f} "
-                f"| psnr={psnr.item():.2f} | keep={keep_prob.mean().item():.3f} "
-                f"| lr={lr:.2e} | {step_time * 1000:.1f}ms/step"
+                f"step {state.steps:07d} | loss={train_stats['total_losses'].item():.6f} "
+                f"| mse={train_stats['mse_losses'].item():.6f} | lpips={train_stats['lpips_losses'].item():.4f} "
+                f"| psnr={psnr.item():.2f} | keep={train_stats['keep_prob'].item():.3f} "
+                f"| lr={lr:.2e} | {train_stats['step_time'] * 1000:.1f}ms/step"
             )
 
         # ---- viz ----
         if is_rank0() and viz_every > 0 and (state.steps % viz_every == 0):
             torch.cuda.empty_cache()
 
-            image = run_visualization(model, x, P, viz_max_T, viz_max_items)
+            image = run_visualization(conf=conf, model=model, val_loader=val_loader, device=device)
+
             wandb.log(
                 {
                     "viz/reconstruction": wandb.Image(
