@@ -2,7 +2,7 @@ seed: 0
 
 compile: True
 
-dataset: $(robocasa_data.yaml)
+dataset: $(agibot_data.yaml)
 
 tokenizer: $(tokenizer.yaml)
 dynamics: $(dynamics.yaml)

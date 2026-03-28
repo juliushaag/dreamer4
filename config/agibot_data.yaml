@@ -1,0 +1,57 @@
+# AgiBot World Model dataset configuration
+# Used with AgibotDataset loader
+type: agibot
+
+# Image settings
+image_height: 240
+image_width: 320
+image_channels: 3
+
+# Action dimension (padded size)
+# Native action dim is 22: 14 joints + 6 end effector (2x3) + 2 gripper
+action_dim: 32
+
+# Sequence length for training
+sequence_length: 8
+
+# Train/val split fraction (respects episode boundaries)
+val_fraction: 0.1
+
+# Root directory of AgiBot WorldModel dataset
+data_root: /dataset/AgiBotWorldModel/train
+
+# Maximum number of episodes to load (-1 for all)
+# Set to smaller value for debugging/testing
+max_episodes: -1
+
+# Language embedding dimension (placeholder)
+lang_dim: 512
+
+# Action representation settings
+# use_joints_as_actions: true = delta positions, false = absolute positions
+use_joints_as_actions: true
+
+# Include end effector positions in actions (6 dims) and gripper (2 dims)
+include_end_effector: true
+
+# Video loading settings
+# use_mmap: Use memory-mapped pre-decoded .npy files if available (faster, OS handles caching)
+# If false, always loads full arrays into memory
+use_mmap: true
+
+# Observation structure (all observations returned in obs dict):
+#   obs.images:            (T+1, 3, H, W) - head camera RGB
+#   obs.joint_position:    (T+1, 14) - joint positions (7 per arm)
+#   obs.joint_current:     (T+1, 14) - joint current values
+#   obs.end_position:      (T+1, 2, 3) - end effector positions (left, right)
+#   obs.end_orientation:   (T+1, 2, 4) - end effector orientations (quaternion)
+#   obs.gripper_position:  (T+1, 2) - gripper positions (left, right)
+#   obs.head_position:     (T+1, 2) - head joint positions
+#   obs.waist_position:    (T+1, 2) - waist joint positions
+#   obs.robot_position:    (T+1, 3) - robot base position
+#   obs.robot_orientation: (T+1, 4) - robot base orientation (quaternion)
+
+# Dataset statistics (full train set):
+#   - ~32,500 episodes
+#   - ~245 frames per episode (30 fps)
+#   - Total: ~8M frames

@@ -129,7 +129,7 @@ def create_cosine_scheduler(
 
 def num_model_params(model : torch.nn.Module):
     return {
-        "trainable" : sum(p.numel() for p in model.parameters() if p.requires_grad),
-        "frozen" : sum(p.numel() for p in model.parameters() if not p.requires_grad),
-        "all" : sum(p.numel() for p in model.parameters())
+        "trainable" : sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad),
+        "frozen" : sum(p.numel() * p.element_size() for p in model.parameters() if not p.requires_grad),
+        "all" : sum(p.numel() * p.element_size() for p in model.parameters())
     } 

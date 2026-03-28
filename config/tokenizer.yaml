@@ -1,6 +1,6 @@
 checkpoint_dir: ./logs/tokenizer_ckpts
 
-patch_size: 8
+patch_size: 16
 
 latent_dim: 512
 compile: True 
@@ -19,7 +19,7 @@ gradient_checkpointing: true  # Enable to save memory
 # Attention configuration
 attention:
   heads: 24
-  kv_heads: 8  # Number of KV heads for GQA (must divide num_heads)
+  kv_heads: 8  # Number of KV heads for GQA (must divide heads)
   head_dim : 16
   dropout: 0.05
   qk_norm: true  # Use QK normalization
@@ -42,12 +42,12 @@ lpips:
   net: "alex"
 
 dataloader:
-  batch_size: 32
+  batch_size: 8
   num_workers: 8
   pin_memory: true
   drop_last: true
   persistent_workers: true
-  prefetch_factor: 4
+  prefetch_factor: 2
 
 wandb:
   mode: "online"
@@ -55,7 +55,7 @@ wandb:
   entity: null
 
 training:
-  grad_accum: 2
+  grad_accum: 8
   maxsteps: 2000000
   log_every: 10
   print_every: 100
